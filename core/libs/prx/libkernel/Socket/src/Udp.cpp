@@ -202,15 +202,44 @@ int Transfer(Socket& socket, bool send, int flags, int length, TOperation operat
 #endif
 }
 
-#ifdef _WIN32
 int TransferForNativeOwner(KernelSocketPoll::NativeOwner* owner, bool send, void* buffer, int length) {
     auto& socket = *static_cast<Socket*>(owner);
+#ifdef _WIN32
     return Transfer(socket, send, 0, length, [&](int offset) {
         auto* bytes = offset == 0 ? static_cast<char*>(buffer) : static_cast<char*>(buffer) + offset;
         return send ? ::send(socket.value, bytes, length - offset, 0) : ::recv(socket.value, bytes, length - offset, 0);
     });
-}
+#else
+    bool nonblocking;
+    std::int64_t timeout;
+    {
+        std::lock_guard lock(socket.modeMutex);
+        nonblocking = socket.options.nonblocking;
+        timeout = send ? socket.options.sendTimeout : socket.options.receiveTimeout;
+    }
+    const auto deadline = timeout == 0 ? std::chrono::steady_clock::time_point::max() :
+        KernelSocketSelect::DeadlineAfter(std::chrono::steady_clock::now(), timeout >> 32,
+            (static_cast<std::int64_t>(static_cast<std::uint32_t>(timeout)) * 1000000) >> 32);
+    for (;;) {
+        const auto result = send
+            ? ::send(socket.value, buffer, static_cast<std::size_t>(length), NativeSendFlags(GuestDontWait | GuestNoSignal))
+            : ::recv(socket.value, buffer, static_cast<std::size_t>(length), NativeReceiveFlags(GuestDontWait, socket.type));
+        if (result >= 0 || nonblocking || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) return static_cast<int>(result);
+        int milliseconds = -1;
+        if (timeout != 0) {
+            const auto remaining = deadline - std::chrono::steady_clock::now();
+            if (remaining <= std::chrono::steady_clock::duration::zero()) {
+                errno = EAGAIN;
+                return -1;
+            }
+            milliseconds = static_cast<int>(std::min<std::int64_t>(
+                std::chrono::ceil<std::chrono::milliseconds>(remaining).count(), INT_MAX));
+        }
+        pollfd ready{socket.value, static_cast<short>(send ? POLLOUT : POLLIN), 0};
+        if (::poll(&ready, 1, milliseconds) < 0 && errno != EINTR) return -1;
+    }
 #endif
+}
 
 struct Waker {
     NativeSocket value = Invalid;
@@ -333,8 +362,8 @@ int Install(std::shared_ptr<Socket> socket) {
     unsigned long nonblocking = 1;
     if (ioctlsocket(socket->value, FIONBIO, &nonblocking)) return Fail(NativeError());
     socket->options.transportNonblocking = true;
-    socket->transfer = TransferForNativeOwner;
 #endif
+    socket->transfer = TransferForNativeOwner;
     const int number = ReserveNumber(socket->value);
     if (number < 0) return -1;
     try {

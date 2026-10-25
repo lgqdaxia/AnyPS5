@@ -7,6 +7,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#ifndef _WIN32
+#include "prx/libkernel/Socket/include/SocketPoll.hpp"
+#include <cerrno>
+#include <csignal>
+#include <pthread.h>
+#include <thread>
+#endif
 
 struct Timeval {
     std::int64_t seconds;
@@ -50,6 +57,48 @@ static bool Reads(int descriptor, int option, std::int64_t seconds, std::int64_t
     return getsockopt_nid_postfix(descriptor, SocketLevel, option, &time, &length) == 0 && length == sizeof(time) &&
         time.seconds == seconds && time.microseconds == microseconds;
 }
+
+#ifndef _WIN32
+static volatile std::sig_atomic_t nativeInterrupted = 0;
+
+static void RecordNativeInterrupt(int) {
+    nativeInterrupted = 1;
+}
+
+static void RetainedTimeoutWithInterrupts() {
+    int descriptors[2]{};
+    Require(socketpair_nid_postfix(1, 1, 0, descriptors) == 0);
+    Require(Set(descriptors[0], ReceiveTimeout, 0, 60000) == 0);
+    std::shared_ptr<void> owner;
+    std::uintptr_t native = 0;
+    Require(KernelLookupSocketNative_nid_no_patch(descriptors[0], &owner, &native));
+    auto* transport = static_cast<KernelSocketPoll::NativeOwner*>(owner.get());
+    Require(transport != nullptr && transport->transfer != nullptr);
+    Require(close_nid_postfix(descriptors[0]) == 0);
+    struct sigaction action{};
+    action.sa_handler = RecordNativeInterrupt;
+    Require(sigemptyset(&action.sa_mask) == 0 && sigaction(SIGUSR1, &action, nullptr) == 0);
+    sigset_t signal;
+    Require(sigemptyset(&signal) == 0 && sigaddset(&signal, SIGUSR1) == 0);
+    Require(pthread_sigmask(SIG_UNBLOCK, &signal, nullptr) == 0);
+    const auto thread = pthread_self();
+    std::jthread interrupts([thread] {
+        for (int index = 0; index < 8; ++index) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            pthread_kill(thread, SIGUSR1);
+        }
+    });
+    char byte = 'x';
+    const auto started = Clock::now();
+    const int result = transport->transfer(transport, false, &byte, 1);
+    const int error = errno;
+    const auto elapsed = Clock::now() - started;
+    interrupts.join();
+    Require(nativeInterrupted != 0 && result == -1 && error == EAGAIN && byte == 'x');
+    Require(elapsed >= std::chrono::milliseconds(59));
+    Require(close_nid_postfix(descriptors[1]) == 0);
+}
+#endif
 
 int main() {
     const int datagram = socket_nid_postfix(2, 2, 0);
@@ -129,5 +178,8 @@ int main() {
 
     Require(close_nid_postfix(server) == 0 && close_nid_postfix(client) == 0);
     Require(close_nid_postfix(listener) == 0 && close_nid_postfix(datagram) == 0);
+#ifndef _WIN32
+    RetainedTimeoutWithInterrupts();
+#endif
     return 0;
 }

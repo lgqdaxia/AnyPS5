@@ -1011,6 +1011,7 @@ void APS5_VABI _ZNSt4_PadC2Ev_nid_postfix(GuestPad* pad);
 void APS5_VABI _ZNSt4_PadD2Ev_nid_postfix(GuestPad* pad);
 void APS5_VABI _ZNSt4_Pad8_ReleaseEv_nid_postfix(GuestPad* pad);
 void APS5_VABI _ZNSt4_Pad7_LaunchEPP7pthread_nid_postfix(GuestPad* pad, void** thread);
+void APS5_VABI _ZNSt4_Pad7_LaunchEPP12pthread_attrPP7pthread_nid_postfix(GuestPad* pad, void** attrSlot, void** thread);
 int APS5_VABI _Thrd_join_nid_postfix(void* thread, int* code);
 int APS5_VABI _Thrd_detach_nid_postfix(void* thread);
 void* APS5_VABI _Thrd_id_nid_postfix(void);

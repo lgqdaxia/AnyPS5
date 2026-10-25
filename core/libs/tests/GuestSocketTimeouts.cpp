@@ -82,8 +82,8 @@ static void RetainedTimeoutWithInterrupts() {
     Require(sigemptyset(&signal) == 0 && sigaddset(&signal, SIGUSR1) == 0);
     Require(pthread_sigmask(SIG_UNBLOCK, &signal, nullptr) == 0);
     const auto thread = pthread_self();
-    std::jthread interrupts([thread] {
-        for (int index = 0; index < 8; ++index) {
+    std::jthread interrupts([thread](std::stop_token stop) {
+        for (int index = 0; index < 300 && !stop.stop_requested(); ++index) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             pthread_kill(thread, SIGUSR1);
         }
@@ -93,9 +93,11 @@ static void RetainedTimeoutWithInterrupts() {
     const int result = transport->transfer(transport, false, &byte, 1);
     const int error = errno;
     const auto elapsed = Clock::now() - started;
+    interrupts.request_stop();
     interrupts.join();
     Require(nativeInterrupted != 0 && result == -1 && error == EAGAIN && byte == 'x');
     Require(elapsed >= std::chrono::milliseconds(59));
+    Require(elapsed < std::chrono::seconds(1));
     Require(close_nid_postfix(descriptors[1]) == 0);
 }
 #endif

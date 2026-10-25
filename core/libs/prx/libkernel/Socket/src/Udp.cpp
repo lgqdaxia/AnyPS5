@@ -159,15 +159,19 @@ int Transfer(Socket& socket, bool send, int flags, int length, TOperation operat
     }
     const bool complete = socket.type == 1 && !nonblocking &&
         (send || ((flags & GuestWaitAll) != 0 && (flags & GuestPeek) == 0));
-    const auto deadline = timeout == 0 ? std::chrono::steady_clock::time_point::max() :
-        KernelSocketSelect::DeadlineAfter(std::chrono::steady_clock::now(), timeout >> 32,
-            (static_cast<std::int64_t>(static_cast<std::uint32_t>(timeout)) * 1000000) >> 32);
+    const auto nextDeadline = [timeout] {
+        return timeout == 0 ? std::chrono::steady_clock::time_point::max() :
+            KernelSocketSelect::DeadlineAfter(std::chrono::steady_clock::now(), timeout >> 32,
+                (static_cast<std::int64_t>(static_cast<std::uint32_t>(timeout)) * 1000000) >> 32);
+    };
+    auto deadline = nextDeadline();
     int transferred = 0;
     for (;;) {
         const int result = operation(transferred);
         if (result >= 0) {
             transferred += result;
             if (!complete || result == 0 || transferred == length) return transferred;
+            deadline = nextDeadline();
             continue;
         }
         if (WSAGetLastError() != WSAEWOULDBLOCK || nonblocking) return transferred == 0 ? -1 : transferred;

@@ -307,10 +307,8 @@ bool DeliverPendingSignal(int guest) {
 }
 
 void DeliverUnblockedPending() {
-    for (int guest = 1; guest <= MaxSignal; ++guest) {
-        if (SignalBlocked(guest) || !Deliverable(guest) || !TakePending(guest)) continue;
-        DeliverPendingSignal(guest);
-    }
+    int guest = 0;
+    while (TakePendingUnblocked(&guest)) DeliverPendingSignal(guest);
 }
 
 int WaitForPendingInSet(const GuestSignalSet& set, bool waitForever, const KernelTimespec* timeout, int* guest) {

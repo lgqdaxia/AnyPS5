@@ -649,6 +649,7 @@ int APS5_VABI getlogin_r_nid_postfix(char* output, int size);
 char* APS5_VABI getlogin_nid_postfix(void);
 int APS5_VABI sceKernelDebugOutText(int channel, const char* text);
 int APS5_VABI sceKernelSendNotificationRequest(int device, const void* request, std::size_t size, int flags);
+extern char** environ_nid_postfix;
 int APS5_VABI getargc_nid_postfix(void);
 const char** APS5_VABI getargv_nid_postfix(void);
 int APS5_VABI getpagesize_nid_postfix(void);

@@ -246,9 +246,17 @@ static void RequireNativeNonblocking(const PassedSocket& socket, const Flags& fl
     Require(value == -1 && error == EAGAIN && byte == '?');
 }
 
-static void CheckFlags() {
-    PassedSocket socket{true};
-    const auto flags = ObserveFlags(socket, "flags");
+static void SetAliasNonblocking(PassedSocket& socket) {
+    const auto before = ObserveFlags(socket, "alias before F_SETFL");
+    Require(before.originalGuest == ReadWrite && before.passedGuest == ReadWrite);
+    Require((before.originalNative & O_NONBLOCK) == 0 && (before.passedNative & O_NONBLOCK) == 0);
+    Require(fcntl_nid_postfix(socket.source.descriptors[0], SetFlags, ReadWrite | NonBlocking) == 0);
+}
+
+static void CheckFlags(bool alias) {
+    PassedSocket socket{!alias};
+    if (alias) SetAliasNonblocking(socket);
+    const auto flags = ObserveFlags(socket, alias ? "alias flags after F_SETFL" : "flags");
     RequireNativeNonblocking(socket, flags);
     Require(flags.originalGuest == (ReadWrite | NonBlocking));
     Require(flags.passedGuest == flags.originalGuest);
@@ -256,12 +264,7 @@ static void CheckFlags() {
 
 static void CheckOwner(bool alias) {
     PassedSocket socket{!alias};
-    if (alias) {
-        const auto before = ObserveFlags(socket, "alias before F_SETFL");
-        Require(before.originalGuest == ReadWrite && before.passedGuest == ReadWrite);
-        Require((before.originalNative & O_NONBLOCK) == 0 && (before.passedNative & O_NONBLOCK) == 0);
-        Require(fcntl_nid_postfix(socket.source.descriptors[0], SetFlags, ReadWrite | NonBlocking) == 0);
-    }
+    if (alias) SetAliasNonblocking(socket);
     const char* mode = alias ? "alias after F_SETFL" : "owner";
     const auto flags = ObserveFlags(socket, mode);
     RequireNativeNonblocking(socket, flags);
@@ -270,7 +273,7 @@ static void CheckOwner(bool alias) {
     ReportRead(mode, result);
     Require(!result.released && result.value == -1 && result.error == EAGAIN && result.byte == '?');
     Require(result.milliseconds < 1000);
-    Require(flags.originalGuest == (ReadWrite | NonBlocking) && flags.passedGuest == flags.originalGuest);
+    Require(flags.originalGuest == (ReadWrite | NonBlocking));
 }
 
 static void CheckTimeout() {
@@ -291,14 +294,20 @@ static void CheckTimeout() {
     Require(passed.tv_sec == original.tv_sec && passed.tv_usec == original.tv_usec);
 }
 
-static void CheckBlocking() {
-    PassedSocket socket;
-    const auto flags = ObserveFlags(socket, "blocking");
-    Require(flags.originalGuest == ReadWrite && flags.passedGuest == ReadWrite);
+static void CheckBlocking(bool alias) {
+    PassedSocket socket{alias};
+    if (alias) {
+        Require(fcntl_nid_postfix(socket.received.value, SetFlags, ReadWrite | NonBlocking) == 0);
+        Require(fcntl_nid_postfix(socket.source.descriptors[0], SetFlags, ReadWrite) == 0);
+    }
+    const char* mode = alias ? "alias blocking after F_SETFL" : "blocking";
+    const auto flags = ObserveFlags(socket, mode);
+    Require(flags.originalGuest == ReadWrite);
+    if (!alias) Require(flags.passedGuest == ReadWrite);
     Require((flags.originalNative & O_NONBLOCK) == 0 && (flags.passedNative & O_NONBLOCK) == 0);
     socket.received.Close();
     const auto result = ReadBounded(socket.passed, socket.peer, true);
-    ReportRead("blocking", result);
+    ReportRead(mode, result);
     Require(result.sent && result.sentBytes == 1 && !result.released && result.value == 1 && result.byte == 'z');
     Require(result.milliseconds >= 50 && result.milliseconds < 1500);
 }
@@ -306,11 +315,13 @@ static void CheckBlocking() {
 int main(int argc, char** argv) {
     if (argc != 2) return 2;
     const std::string_view mode = argv[1];
-    if (mode == "flags") CheckFlags();
+    if (mode == "flags") CheckFlags(false);
     else if (mode == "owner") CheckOwner(false);
     else if (mode == "alias") CheckOwner(true);
+    else if (mode == "alias-flags") CheckFlags(true);
+    else if (mode == "alias-blocking") CheckBlocking(true);
     else if (mode == "timeout") CheckTimeout();
-    else if (mode == "blocking") CheckBlocking();
+    else if (mode == "blocking") CheckBlocking(false);
     else return 2;
     return 0;
 }

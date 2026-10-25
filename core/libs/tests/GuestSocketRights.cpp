@@ -1,4 +1,6 @@
 #include "SceTypes.hpp"
+#include "prx/libc/include/Api.hpp"
+#include "prx/libkernel/include/Api.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <array>
 #include <cstdint>
@@ -8,34 +10,8 @@
 #include <initializer_list>
 #include <sys/mman.h>
 
-struct Iovec {
-    void* base;
-    std::uint64_t length;
-};
-
-struct Msghdr {
-    void* name;
-    std::uint32_t nameLength;
-    Iovec* iov;
-    int iovLength;
-    void* control;
-    std::uint32_t controlLength;
-    int flags;
-};
-
-extern "C" {
-int APS5_VABI socketpair_nid_postfix(int, int, int, int*);
-int APS5_VABI pipe_nid_postfix(int*);
-std::int64_t APS5_VABI sendmsg_nid_postfix(int, const Msghdr*, int);
-std::int64_t APS5_VABI recvmsg_nid_postfix(int, Msghdr*, int);
-std::int64_t APS5_VABI send_nid_postfix(int, const void*, std::uint64_t, int);
-std::int64_t APS5_VABI recv_nid_postfix(int, void*, std::uint64_t, int);
-std::int64_t APS5_VABI read_nid_postfix(int, void*, std::uint64_t);
-std::int64_t APS5_VABI write_nid_postfix(int, const char*, std::int64_t);
-int APS5_VABI fcntl_nid_postfix(int, int, ...);
-int APS5_VABI close_nid_postfix(int);
-int* APS5_VABI __error_nid_postfix();
-}
+using Iovec = KernelIovec;
+using Msghdr = GuestMsghdr;
 
 static void Require(bool value) { if (!value) std::abort(); }
 

@@ -214,7 +214,9 @@ int TransferForNativeOwner(KernelSocketPoll::NativeOwner* owner, bool send, void
     std::int64_t timeout;
     {
         std::lock_guard lock(socket.modeMutex);
-        nonblocking = socket.options.nonblocking;
+        const int flags = ::fcntl(socket.value, F_GETFL);
+        if (flags < 0) return -1;
+        nonblocking = (flags & O_NONBLOCK) != 0;
         timeout = send ? socket.options.sendTimeout : socket.options.receiveTimeout;
     }
     const auto deadline = timeout == 0 ? std::chrono::steady_clock::time_point::max() :

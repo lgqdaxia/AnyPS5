@@ -21,6 +21,7 @@
 #include <shared_mutex>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -492,6 +493,14 @@ public:
         else stencilFill = stencil;
     }
 
+    void TakeGuestSnapshotFrom(const DepthSurface& source) {
+        if (source.guestSnapshot == nullptr) return;
+        SizeUnits(source.guestSnapshot->bytes.size());
+        if (guestSnapshot != source.guestSnapshot) DropMirror();
+        guestSnapshot = source.guestSnapshot;
+        unitGeneration = source.unitGeneration;
+    }
+
     void CopyAspectFrom(const DepthSurface& source, VkImageAspectFlagBits aspect) {
         ForgetClear(aspect);
         NoteHostWrite();
@@ -728,6 +737,7 @@ public:
     std::shared_ptr<StorageTexture> Mirror(const GuestTextureResource& resource) {
         if (mirrorPlane.storage == nullptr) {
             mirrorPlane.storage = StorageTexture::Create(context, *context.detiler, resource, 0);
+            observeMirror(mirrorPlane.storage);
             ++mirrorEpoch;
         }
         return mirrorPlane.storage;
@@ -771,6 +781,7 @@ public:
         staleUnits.assign(count, false);
         staleCount = 0;
         unitGeneration.assign(count, 0);
+        guestSnapshot = std::make_shared<GuestSnapshot>();
     }
 
     bool AnyStale() const {
@@ -824,44 +835,63 @@ public:
         }
     }
 
-    std::vector<bool> WrittenUnits(const GuestTextureResource& resource, std::uint64_t& generation) {
+    std::vector<bool> WrittenUnits(const GuestTextureResource& resource, std::uint64_t& generation, std::vector<std::byte>* observed = nullptr) {
+        Syncing guard{syncing};
         const auto bytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
         SizeUnits(bytes);
-        GuestMemory::CollectWrites(resource.baseAddress, bytes);
+        Require(awaitGuestSnapshot(), "depth memory cannot be compared during its write-back completion");
+        if (guestSnapshot->bytes.size() != bytes) {
+            guestSnapshot->bytes.resize(bytes);
+            GuestMemory::ReadCommittedUnsynced(resource.baseAddress, guestSnapshot->bytes);
+        }
+        const auto collected = GuestMemory::CollectWrites(resource.baseAddress, bytes);
         generation = GuestMemory::TrackerGeneration();
         std::vector<bool> changed(unitGeneration.size(), false);
         if (unitGeneration.size() == 1u) {
             changed[0] = GuestMemory::WrittenSince(resource.baseAddress, bytes, unitGeneration[0]);
-            return changed;
+        } else {
+            const auto oldest = *std::min_element(unitGeneration.begin(), unitGeneration.end());
+            if (oldest == 0u || GuestMemory::WrittenSince(resource.baseAddress, bytes, oldest)) {
+                std::vector<std::uint8_t> stamped(unitGeneration.size(), GuestMemory::BlockUnchanged);
+                if (GuestMemory::ChangedBlocks(resource.baseAddress, bytes, unitGeneration, stamped)) {
+                    for (std::size_t unit = 0; unit < changed.size(); ++unit) changed[unit] = unitGeneration[unit] != 0u && stamped[unit] == GuestMemory::BlockWritten;
+                }
+            }
         }
-        const auto oldest = *std::min_element(unitGeneration.begin(), unitGeneration.end());
-        if (oldest != 0u && !GuestMemory::WrittenSince(resource.baseAddress, bytes, oldest)) return changed;
-        std::vector<std::uint8_t> stamped(unitGeneration.size(), GuestMemory::BlockUnchanged);
-        if (!GuestMemory::ChangedBlocks(resource.baseAddress, bytes, unitGeneration, stamped)) return changed;
-        for (std::size_t unit = 0; unit < changed.size(); ++unit) changed[unit] = unitGeneration[unit] != 0u && stamped[unit] == GuestMemory::BlockWritten;
+        if (collected == 0u || anyUnit(changed)) {
+            if (collected == 0u) {
+                GuestMemory::FlushGpuWrites(resource.baseAddress, bytes);
+                Require(awaitGuestSnapshot(), "depth memory cannot be compared during its write-back completion");
+            }
+            std::vector<std::byte> current(bytes);
+            GuestMemory::ReadCommittedUnsynced(resource.baseAddress, current);
+            if (collected == 0u) {
+                for (std::size_t unit = 0; unit < changed.size(); ++unit) {
+                    const auto offset = unit * unitBytes;
+                    const auto length = std::min<std::uint64_t>(unitBytes, bytes - offset);
+                    changed[unit] = std::memcmp(guestSnapshot->bytes.data() + offset, current.data() + offset, static_cast<std::size_t>(length)) != 0;
+                }
+            }
+            if (observed != nullptr) *observed = std::move(current);
+        }
         return changed;
     }
 
-    void SyncFromMemory(const GuestTextureResource& resource) {
+    void SyncFromMemory(const GuestTextureResource& resource, bool depthCleared = false) {
+        Syncing guard{syncing};
         std::uint64_t generation = 0;
-        const auto changed = WrittenUnits(resource, generation);
-        if ((pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || !anyUnit(changed)) {
+        std::vector<std::byte> observed;
+        const auto changed = WrittenUnits(resource, generation, &observed);
+        if (depthCleared || (pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || !anyUnit(changed)) {
+            if (!observed.empty()) commitGuestSnapshot(changed, observed);
             unitGeneration.assign(unitGeneration.size(), generation);
             return;
         }
         ClearStale(changed);
-        {
-            struct Syncing {
-                bool& flag;
-                ~Syncing() { flag = false; }
-            } guard{syncing};
-            syncing = true;
-            if (mirrorPlane.storage == nullptr) {
-                mirrorPlane.storage = StorageTexture::Create(context, *context.detiler, resource, 0);
-                ++mirrorEpoch;
-            } else {
-                static_cast<void>(mirrorPlane.storage->Refresh());
-            }
+        if (mirrorPlane.storage == nullptr) {
+            static_cast<void>(Mirror(resource));
+        } else {
+            static_cast<void>(mirrorPlane.storage->Refresh());
         }
         unitGeneration.assign(unitGeneration.size(), generation);
         const auto mirror = mirrorPlane.storage;
@@ -872,11 +902,16 @@ public:
             ClearStale();
             copyPlane(mirrorPlane, mirror, false, false, true);
         }
+        commitGuestSnapshot(changed, observed);
         written = ++depthWrites;
     }
 
     void DropMirror() {
         mirrorPlane = {};
+    }
+
+    bool GuestSnapshotReady() {
+        return guestSnapshot == nullptr || awaitGuestSnapshot();
     }
 
     std::vector<bool> staleUnits;
@@ -905,6 +940,45 @@ public:
     std::uint64_t sampleShadowWritten = 0u;
 
 private:
+    struct Syncing {
+        bool& flag;
+        bool previous;
+        explicit Syncing(bool& flag) : flag(flag), previous(flag) { flag = true; }
+        ~Syncing() { flag = previous; }
+    };
+    struct GuestSnapshot {
+        std::vector<std::byte> bytes;
+        std::vector<std::weak_ptr<StorageTexture>> mirrors;
+    };
+    std::shared_ptr<GuestSnapshot> guestSnapshot;
+
+    void observeMirror(const std::shared_ptr<StorageTexture>& mirror) {
+        guestSnapshot->mirrors.push_back(mirror);
+        mirror->SetWriteBackObserver([snapshot = std::weak_ptr(guestSnapshot), address = target.address](std::uint64_t begin, std::span<const std::byte> bytes) {
+            const auto alive = snapshot.lock();
+            if (alive == nullptr || begin < address || begin - address > alive->bytes.size() || bytes.size() > alive->bytes.size() - (begin - address)) return;
+            std::memcpy(alive->bytes.data() + (begin - address), bytes.data(), bytes.size());
+        });
+    }
+
+    bool awaitGuestSnapshot() {
+        const auto snapshot = guestSnapshot;
+        std::erase_if(snapshot->mirrors, [](const auto& mirror) { return mirror.expired(); });
+        for (std::size_t index = 0; index < snapshot->mirrors.size(); ++index) {
+            if (auto alive = snapshot->mirrors[index].lock(); alive != nullptr && !alive->AwaitWriteBackSnapshot()) return false;
+        }
+        return true;
+    }
+
+    void commitGuestSnapshot(const std::vector<bool>& units, std::span<const std::byte> bytes) {
+        for (std::size_t unit = 0; unit < units.size(); ++unit) {
+            if (!units[unit]) continue;
+            const auto offset = unit * unitBytes;
+            const auto length = std::min<std::uint64_t>(unitBytes, bytes.size() - offset);
+            std::memcpy(guestSnapshot->bytes.data() + offset, bytes.data() + offset, static_cast<std::size_t>(length));
+        }
+    }
+
     struct PlaneStorage {
         std::shared_ptr<StorageTexture> storage;
         std::vector<std::weak_ptr<StorageTexture>> replaced;
@@ -1508,7 +1582,12 @@ PlaneOwners& stencilOwners() {
 void takePlane(DepthSurface& surface, PlaneOwners& owners, std::uint64_t address, VkImageAspectFlagBits aspect, bool created, VkImageAspectFlags clearAspects) {
     auto& entry = owners[{surface.context.device, address}];
     auto* owner = entry.surface;
-    if (owner != nullptr && owner->active->load(std::memory_order_acquire) && owner != &surface && owner->target.format == surface.target.format && owner->target.samples == surface.target.samples && owner->target.extent.width == surface.target.extent.width && owner->target.extent.height == surface.target.extent.height && (!created || (clearAspects & aspect) == 0)) {
+    if (owner != nullptr && owner->active->load(std::memory_order_acquire) && owner != &surface && owner->target.format == surface.target.format && owner->target.samples == surface.target.samples && owner->target.extent.width == surface.target.extent.width && owner->target.extent.height == surface.target.extent.height) {
+        if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT) surface.TakeGuestSnapshotFrom(*owner);
+        if (created && (clearAspects & aspect) != 0) {
+            entry = {&surface, ++planeBinds};
+            return;
+        }
         if ((owner->pendingClear & aspect) != 0) {
             if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT) surface.depthFill = owner->depthFill;
             else surface.stencilFill = owner->stencilFill;
@@ -2006,14 +2085,15 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     const bool inherits = owner != depthOwners().end() && owner->second.surface->active->load(std::memory_order_acquire) && !owner->second.surface->retired;
     surface->clearDepth = target.clearDepth;
     surface->clearStencil = target.clearStencil;
-    takePlanes(*surface, created, htileCleared | (cleared ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u));
+    const auto clearAspects = htileCleared | (cleared ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u);
+    takePlanes(*surface, created, clearAspects);
     if (created && !inherits && target.htileAddress == 0) surface->TakeStorage();
     if (cleared && (!created || inherits)) {
         if (target.samples != 1u) surface->sampling.Refuse("native multisample depth fast-clear transition is not implemented");
         if (!created) surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
     }
     if (!created) surface->NoteHtileClear(htileCleared);
-    if (mirrorable(target)) surface->SyncFromMemory(mirrorResource(target));
+    if (mirrorable(target)) surface->SyncFromMemory(mirrorResource(target), created && (clearAspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0);
     surface->ApplyFastClear();
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
     surface->written = ++depthWrites;
@@ -2103,6 +2183,10 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
             const auto plane = surface->target.address;
             const auto planeBytes = DescribeSurface(resource).guestBytes;
             const bool overlapped = !surface->syncing && plane < end && address < plane + planeBytes;
+            if (overlapped && Recorder::InCompletion() && !surface->GuestSnapshotReady()) {
+                if (surface->AnyStale()) remaining.emplace_back(plane, plane + planeBytes);
+                continue;
+            }
             if (overlapped && (surface->pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) surface->MarkAllStale(planeBytes);
             if (overlapped && (scope == DepthPlaneScope::Whole || anyUnit(surface->StaleUnitsIn(planeBytes, address, end)))) {
                 if (GuestMemory::CommittedRanges(plane, static_cast<std::size_t>(planeBytes)).empty()) {

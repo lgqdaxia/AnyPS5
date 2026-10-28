@@ -1,6 +1,7 @@
 #include "BdaAbi.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "Recompiler.hpp"
+#include "ShaderDiskCache.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <array>
 #include <cstddef>
@@ -9,6 +10,7 @@
 #include <fstream>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -48,6 +50,47 @@ int main(int argc, char** argv) try {
         std::ofstream file(directory / (mode == 0u ? "inactive.req" : "invalid.req"), std::ios::binary);
         file << RequestSerializer{}.Serialize(request);
         if (!file) throw std::runtime_error("cannot write synthetic replay request");
+    }
+    const std::array<std::uint32_t, 19> ldsCode{
+        0x34040082u, 0x4a020081u, 0xd8340000u, 0x00000102u, 0xbf8cc07fu, 0xbf8a0000u, 0x7da800ffu, 0x00000080u,
+        0xbf880006u, 0xd8d80200u, 0x03000002u, 0xbf8cc07fu, 0x4a020701u, 0xd8340000u, 0x00000102u, 0xbefe03c1u,
+        0xbf8cc07fu, 0xbf8a0000u, 0xbf810000u,
+    };
+    const std::array<std::uint32_t, 2> ldsCapabilities{spv::CapabilityShader, spv::CapabilityGroupNonUniform};
+    const std::array<std::string_view, 1> ldsExtensions{"SPV_KHR_storage_buffer_storage_class"};
+    RecompileRequest lds{};
+    lds.shader = {ShaderStage::Compute, 0x20000u, ldsCode, 0, {}};
+    lds.context.waveSize = 32u;
+    lds.context.compute = ShaderComputeStageInfo{{256u, 1u, 1u}, 512u, {false, false, false}, false, 1u};
+    lds.target.vulkanVersion = 0x00403000u;
+    lds.target.spirvVersion = 0x00010600u;
+    lds.target.subgroupSize = 32u;
+    lds.target.bdaAbiVersion = BdaAbi::Version;
+    lds.target.supportedCapabilities = ldsCapabilities;
+    lds.target.supportedExtensions = ldsExtensions;
+    lds.target.maxWorkgroupSize = {1024u, 1024u, 64u};
+    lds.target.maxWorkgroupInvocations = 1024u;
+    lds.target.maxWorkgroupSharedMemoryBytes = 49152u;
+    lds.layout.pushConstantSizeBytes = 128u;
+    lds.useCache = true;
+    {
+        std::ofstream file(directory / "target-options.req", std::ios::binary);
+        file << RequestSerializer{}.Serialize(lds);
+        if (!file) throw std::runtime_error("cannot write target-option replay request");
+    }
+    char version[17];
+    std::snprintf(version, sizeof(version), "%016llx", static_cast<unsigned long long>(ShaderDiskCache::SourceVersion()));
+    for (const auto option : {"default", "maintenance8", "robust2", "wave-lds-memory-barriers", "device-scope-lds-memory-barriers"}) {
+        auto target = lds;
+        if (std::string_view(option) == "maintenance8") target.target.nonConstantImageOffsets = true;
+        if (std::string_view(option) == "robust2") target.target.robustBufferAccess2 = true;
+        if (std::string_view(option) == "wave-lds-memory-barriers") target.target.waveLdsMemoryBarriers = true;
+        if (std::string_view(option) == "device-scope-lds-memory-barriers") target.target.deviceScopeLdsMemoryBarriers = true;
+        std::vector<std::byte> key;
+        ShaderDiskCache::BuildKey(target, 32u, key);
+        std::ofstream file(directory / (std::string(option) + ".expected"));
+        file << version << '/' << ShaderDiskCache::EntryName(key);
+        if (!file) throw std::runtime_error("cannot write expected target-option cache key");
     }
     std::puts("synthetic guarded replay requests written");
     return 0;

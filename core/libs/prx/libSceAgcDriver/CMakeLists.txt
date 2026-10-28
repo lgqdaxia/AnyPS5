@@ -3547,8 +3547,8 @@ if(BUILD_TESTING)
     set(agcShaderReplayCapture "${CMAKE_CURRENT_BINARY_DIR}/shader-replay-capture")
     add_test(NAME agc_shader_replay_requests COMMAND agc_shader_replay_requests_tests "${agcShaderReplayCapture}")
     set_tests_properties(agc_shader_replay_requests PROPERTIES FIXTURES_SETUP agc_shader_replay_capture TIMEOUT 30)
-    add_test(NAME agc_shader_replay_tool COMMAND ${CMAKE_COMMAND} -DTOOL=$<TARGET_FILE:agc_shader_replay> "-DCAPTURE=${agcShaderReplayCapture}"
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/ShaderReplayTool.cmake)
+    add_test(NAME agc_shader_replay_tool COMMAND ${CMAKE_COMMAND} "-DCAPTURE=${agcShaderReplayCapture}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/ShaderReplayTool.cmake "$<TARGET_FILE:agc_shader_replay>")
     set_tests_properties(agc_shader_replay_tool PROPERTIES FIXTURES_REQUIRED agc_shader_replay_capture TIMEOUT 30)
     set_tests_properties(agc_shader_replay_requests agc_shader_replay_tool PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1")
     if(WIN32)

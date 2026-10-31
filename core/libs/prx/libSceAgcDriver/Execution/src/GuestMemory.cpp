@@ -2826,11 +2826,6 @@ void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> cur
     }
 }
 
-static std::uint32_t changedByteCount(__m128i same) {
-    const auto sums = _mm_sad_epu8(_mm_and_si128(same, _mm_set1_epi8(1)), _mm_setzero_si128());
-    return 16u - static_cast<std::uint32_t>(_mm_cvtsi128_si32(_mm_add_epi32(sums, _mm_unpackhi_epi64(sums, sums))));
-}
-
 std::uint32_t ChangedByteStoreLimit() {
     static const auto limit = [] {
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -2846,11 +2841,21 @@ std::uint32_t ChangedByteStoreLimit() {
     return limit;
 }
 
+static void writeChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint32_t byteStoreLimit, bool keepGuest);
+
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
-    WriteChanged(address, current, original, ChangedByteStoreLimit());
+    writeChanged(address, current, original, ChangedByteStoreLimit(), false);
+}
+
+void WriteChangedKeepingGuest(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
+    writeChanged(address, current, original, ChangedByteStoreLimit(), true);
 }
 
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint32_t byteStoreLimit) {
+    writeChanged(address, current, original, byteStoreLimit, false);
+}
+
+static void writeChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint32_t byteStoreLimit, bool keepGuest) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
     BreakProofs();
     if (current.empty()) return;
@@ -2870,13 +2875,14 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
         std::size_t at = 0;
         for (; at + 16 <= size; at += 16) {
             const auto bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(current.data() + at));
-            const auto same = _mm_cmpeq_epi8(bytes, _mm_loadu_si128(reinterpret_cast<const __m128i*>(original.data() + at)));
-            const auto equal = static_cast<std::uint32_t>(_mm_movemask_epi8(same));
-            if (equal == 0xffffu) continue;
-            const auto changed = ~equal & 0xffffu;
-            if (equal == 0) _mm_storeu_si128(reinterpret_cast<__m128i*>(destination + at), bytes);
-            else if (byteStoreLimit < 16 && changedByteCount(same) > byteStoreLimit) {
-                _mm_maskmoveu_si128(bytes, _mm_xor_si128(same, _mm_set1_epi8(-1)), reinterpret_cast<char*>(destination + at));
+            const auto uploaded = _mm_loadu_si128(reinterpret_cast<const __m128i*>(original.data() + at));
+            const auto gpuSame = _mm_cmpeq_epi8(bytes, uploaded);
+            const auto store = keepGuest ? _mm_andnot_si128(gpuSame, _mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(destination + at)), uploaded)) : _mm_xor_si128(gpuSame, _mm_set1_epi8(-1));
+            const auto changed = static_cast<std::uint32_t>(_mm_movemask_epi8(store));
+            if (changed == 0) continue;
+            if (changed == 0xffffu) _mm_storeu_si128(reinterpret_cast<__m128i*>(destination + at), bytes);
+            else if (byteStoreLimit < 16 && std::popcount(changed) > byteStoreLimit) {
+                _mm_maskmoveu_si128(bytes, store, reinterpret_cast<char*>(destination + at));
                 masked = true;
             } else {
                 for (auto bits = changed; bits != 0; bits &= bits - 1) {
@@ -2889,7 +2895,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
         }
         if (masked) _mm_sfence();
         for (; at < size; ++at) {
-            if (current[at] == original[at]) continue;
+            if (current[at] == original[at] || (keepGuest && destination[at] != original[at])) continue;
             destination[at] = current[at];
             firstChanged = std::min(firstChanged, at);
             lastChanged = std::max(lastChanged, at + 1);

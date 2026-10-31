@@ -671,6 +671,34 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
         resources->MarkGpuWrites(recorder);
     };
+    {
+        auto copiedContext = context;
+        copiedContext.hostImportAlignment = 0;
+        copiedContext.dmaBufImport = false;
+        const auto run = [&](std::uint32_t delta) {
+            auto copied = std::make_shared<ShaderResources>(copiedContext, compute);
+            Require(copied->HasCopiedWrites(), "write-back conflict did not take the copied path");
+            update(copied, delta);
+            recorder.Sync();
+            return copied;
+        };
+        block[0] = 0x10;
+        block[1] = 0x20;
+        const auto first = run(1);
+        block[0] = 0x70;
+        block[1] = 0x25;
+        first->WriteBackBuffers();
+        Require(block[0] == 0x70, "a copied write-back overwrote a byte the CPU changed after upload");
+        Require(block[1] == 0x25, "a copied write-back rolled back a byte the shader did not change");
+        const auto second = run(2);
+        second->WriteBackBuffers();
+        Require(block[0] == 0x72, "a copied write-back skipped a GPU-only change");
+        block[0] = 0x10;
+        const auto third = run(1);
+        block[0] = 0x00aa0010u;
+        third->WriteBackBuffers();
+        Require(block[0] == 0x00aa0011u, "a copied write-back did not merge CPU and GPU bytes in one dword");
+    }
     for (int mode = 0; mode < 3; ++mode) {
         *block = 10;
         auto copiedContext = context;

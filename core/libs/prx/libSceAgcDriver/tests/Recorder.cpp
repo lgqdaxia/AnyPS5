@@ -879,6 +879,86 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
     std::cout << "Copied producers precede fresh and reused direct consumers\n";
 }
 
+bool changedCopyTests(const Device& device, Recorder& recorder) {
+    Require(recorder.Idle(), "the changed copy test needs an idle recorder");
+    if (!device.GetContext().bufferDeviceAddress) {
+        std::cout << "changed copy tests skipped: no buffer device addresses\n";
+        return false;
+    }
+    constexpr std::uint32_t words = 70000;
+    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    auto result = std::make_shared<Buffer>(device.GetContext(), words * 4u, usage);
+    auto snapshot = std::make_shared<Buffer>(device.GetContext(), words * 4u, usage);
+    auto target = std::make_shared<Buffer>(device.GetContext(), words * 4u, usage);
+    constexpr std::uint32_t byteMasks[] = {0xffffffffu, 0x000000ffu, 0x0000ff00u, 0x00ff0000u, 0xff000000u, 0x00ffff00u};
+    std::vector<std::uint32_t> uploaded(words), shader(words), held(words), expected(words);
+    std::uint32_t contested = 0;
+    std::uint32_t mixed = 0;
+    for (std::uint32_t i = 0; i < words; ++i) {
+        uploaded[i] = i * 2654435761u;
+        shader[i] = i % 7 == 0 ? uploaded[i] ^ (0x5a5a5a5au & byteMasks[(i / 7) % 6]) : uploaded[i];
+        held[i] = i % 5 == 0 ? uploaded[i] ^ (0xc3c3c3c3u & byteMasks[(i / 5 + 1) % 6]) : uploaded[i];
+        bool overlap = false;
+        for (std::uint32_t shift = 0; shift < 32; shift += 8) {
+            const auto mask = 0xffu << shift;
+            const bool byShader = (shader[i] & mask) != (uploaded[i] & mask);
+            const bool byCpu = (held[i] & mask) != (uploaded[i] & mask);
+            expected[i] |= (byShader && !byCpu ? shader[i] : held[i]) & mask;
+            overlap = overlap || (byShader && byCpu);
+        }
+        contested += overlap ? 1u : 0u;
+        mixed += expected[i] != shader[i] && expected[i] != held[i] ? 1u : 0u;
+    }
+    Require(contested != 0 && mixed != 0, "the changed copy data lacks words both sides changed or words that mix their bytes");
+    auto counter = std::make_shared<Buffer>(device.GetContext(), 16, usage);
+    std::memset(counter->Bytes().data(), 0, 16);
+    std::memcpy(snapshot->Bytes().data(), uploaded.data(), words * 4u);
+    std::memcpy(result->Bytes().data(), shader.data(), words * 4u);
+    std::memcpy(target->Bytes().data(), held.data(), words * 4u);
+    Require(recorder.RecordChangedCopy(recorder.Commands(), result->DeviceAddress(), snapshot->DeviceAddress(), target->DeviceAddress(), words, counter->DeviceAddress()), "the changed copy kernel is unavailable");
+    recorder.Keep(result);
+    recorder.Keep(snapshot);
+    recorder.Keep(target);
+    recorder.Keep(counter);
+    recorder.Submit();
+    device.WaitQueue();
+    recorder.Sync();
+    std::vector<std::uint32_t> stored(words);
+    std::memcpy(stored.data(), target->Bytes().data(), words * 4u);
+    for (std::uint32_t i = 0; i < words; ++i) {
+        Require(stored[i] == expected[i], "changed copy word " + std::to_string(i) + ": " + std::to_string(stored[i]) + ", expected " + std::to_string(expected[i]) + " (the shader's changed bytes over the target's own)");
+    }
+    std::uint32_t counted = 0;
+    std::memcpy(&counted, counter->Bytes().data(), sizeof(counted));
+    Require(counted == contested, "the changed copy counted " + std::to_string(counted) + " words with bytes both sides changed, expected " + std::to_string(contested));
+    constexpr std::uint64_t lead = 0x1000;
+    auto imported = std::make_shared<Buffer>(device.GetContext(), lead + words * 4u, usage);
+    std::memset(imported->Bytes().data(), 0xa5, lead);
+    std::memcpy(imported->Bytes().data() + lead, held.data(), words * 4u);
+    HostImport import{};
+    import.base = 0x7f0000011000ull;
+    import.bytes = words * 4u;
+    import.address = imported->DeviceAddress() + lead;
+    import.lead = lead;
+    const auto start = HostImportBufferStart(import);
+    Require(start.guest == import.base - lead && start.device == imported->DeviceAddress() && HostImportOffset(import, import.base) == lead, "the copy source of an import with a lead does not start at the import's buffer");
+    Require(recorder.RecordChangedCopy(recorder.Commands(), result->DeviceAddress(), snapshot->DeviceAddress(), start.device + (import.base - start.guest), words), "the changed copy kernel is unavailable");
+    recorder.Keep(result);
+    recorder.Keep(snapshot);
+    recorder.Keep(imported);
+    recorder.Submit();
+    device.WaitQueue();
+    recorder.Sync();
+    for (std::uint64_t i = 0; i < lead; ++i) Require(imported->Bytes()[i] == std::byte{0xa5}, "the changed copy into an import with a lead wrote byte " + std::to_string(i) + " of the lead");
+    std::memcpy(stored.data(), imported->Bytes().data() + lead, words * 4u);
+    for (std::uint32_t i = 0; i < words; ++i) {
+        Require(stored[i] == expected[i], "changed copy word " + std::to_string(i) + " after a lead: " + std::to_string(stored[i]) + ", expected " + std::to_string(expected[i]));
+    }
+    import.address = 0;
+    Require(HostImportBufferStart(import).device == 0, "an import without a device address gained one from its lead");
+    return true;
+}
+
 void readTrackingTests(const Device& device, Recorder& recorder) {
     Require(Recorder::ReadTracking(), "read tracking is off (APS5_COPY_READ_TRACKING=0 set?)");
     Require(recorder.Idle() && !recorder.PendingReadOverlaps(0x10000, 16), "a fresh recorder reports a read");
@@ -3826,6 +3906,11 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         std::uint32_t innerAdjustment = 0;
         Require(memory.Descriptor(element + 16, 64, innerAdjustment).buffer == view.buffer, "a read inside the staged element does not read its shadow");
         recorder.Sync();
+        const bool changedCopy = std::getenv("APS5_NO_CHANGED_COPY_BACK") == nullptr && std::getenv("APS5_CHANGED_COPY_ALWAYS") == nullptr;
+        auto* contested = static_cast<volatile std::uint32_t*>(words + first + 70);
+        auto* untouched = static_cast<volatile std::uint32_t*>(words + first + 100);
+        *contested = 0x11111133u;
+        *untouched = 0x44444444u;
         auto commands = recorder.Commands();
         fill(commands, view.buffer, view.offset + adjustment + 64u * 4u, 64, 0x22222222u);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
@@ -3835,10 +3920,32 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         std::size_t wrong = 0;
         for (std::size_t index = 0; index < bytes / 4u; ++index) {
             const auto at = index >= first ? index - first : bytes;
-            const auto expected = at >= 64 && at < 80 ? 0x22222222u : 0x11111111u;
+            auto expected = at >= 64 && at < 80 ? 0x22222222u : 0x11111111u;
+            if (at == 70 && changedCopy) expected = 0x22222233u;
+            if (at == 100 && changedCopy) expected = 0x44444444u;
             if (words[index] != expected && wrong++ < 8) std::cout << "address-based staging copy-back dword " << index << " holds 0x" << std::hex << words[index] << ", expected 0x" << expected << std::dec << "\n";
         }
         Require(wrong == 0, "an address-based staged copy-back left the wrong guest bytes");
+        if (changedCopy) {
+            std::memset(block, 0x66, bytes);
+            memory.RecordStagingCopies(recorder);
+            recorder.Sync();
+            *contested = 0x66666699u;
+            *untouched = 0x88888888u;
+            commands = recorder.Commands();
+            fill(commands, view.buffer, view.offset + adjustment + 64u * 4u, 64, 0x77777777u);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+            memory.RecordCopyBacks(recorder);
+            recorder.Sync();
+            memory.MarkDirectWrites();
+            for (std::size_t index = 0; index < bytes / 4u; ++index) {
+                const auto at = index >= first ? index - first : bytes;
+                auto expected = at >= 64 && at < 80 ? 0x77777777u : 0x66666666u;
+                if (at == 70) expected = 0x77777799u;
+                if (at == 100) expected = 0x88888888u;
+                Require(words[index] == expected, "a reused staged copy-back did not refresh its upload baseline at dword " + std::to_string(index));
+            }
+        }
         memory.WriteBack();
     }
     std::memset(block, 0x11, bytes);
@@ -12180,6 +12287,9 @@ int main(int argc, char** argv) {
             copiedDirectOrderingTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--changed-copy-only") {
+            return changedCopyTests(device, recorder) ? 0 : 77;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--pending-write-snapshot-only") {
             pendingWriteSnapshotTests(device, recorder);
             return 0;
@@ -12465,6 +12575,7 @@ int main(int argc, char** argv) {
         readListTests(device, recorder);
         overlappedRangeTests(recorder);
         spaceWriteSyncTests(device, recorder);
+        changedCopyTests(device, recorder);
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
         afterRecordedWorkTests(device, recorder);

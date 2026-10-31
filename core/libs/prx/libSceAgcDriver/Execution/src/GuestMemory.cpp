@@ -2866,6 +2866,8 @@ static void writeChanged(std::uint64_t address, std::span<const std::byte> curre
     const TimedAccess timed(CounterChangedWrite, current.size());
     auto* destination = reinterpret_cast<std::byte*>(address);
     const auto size = current.size();
+    std::size_t firstConflict = size;
+    std::size_t conflictBytes = 0;
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
     storeOwn(address, size, [&] {
         CheckRange(destination, size, 1, true);
@@ -2877,7 +2879,16 @@ static void writeChanged(std::uint64_t address, std::span<const std::byte> curre
             const auto bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(current.data() + at));
             const auto uploaded = _mm_loadu_si128(reinterpret_cast<const __m128i*>(original.data() + at));
             const auto gpuSame = _mm_cmpeq_epi8(bytes, uploaded);
-            const auto store = keepGuest ? _mm_andnot_si128(gpuSame, _mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(destination + at)), uploaded)) : _mm_xor_si128(gpuSame, _mm_set1_epi8(-1));
+            const auto cpuSame = keepGuest ? _mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(destination + at)), uploaded) : _mm_set1_epi8(-1);
+            const auto gpuChanged = _mm_xor_si128(gpuSame, _mm_set1_epi8(-1));
+            const auto store = _mm_and_si128(gpuChanged, cpuSame);
+            if (keepGuest) {
+                const auto conflict = static_cast<std::uint32_t>(_mm_movemask_epi8(_mm_andnot_si128(cpuSame, gpuChanged)));
+                if (conflict != 0) {
+                    firstConflict = std::min(firstConflict, at + static_cast<std::size_t>(std::countr_zero(conflict)));
+                    conflictBytes += std::popcount(conflict);
+                }
+            }
             const auto changed = static_cast<std::uint32_t>(_mm_movemask_epi8(store));
             if (changed == 0) continue;
             if (changed == 0xffffu) _mm_storeu_si128(reinterpret_cast<__m128i*>(destination + at), bytes);
@@ -2895,13 +2906,24 @@ static void writeChanged(std::uint64_t address, std::span<const std::byte> curre
         }
         if (masked) _mm_sfence();
         for (; at < size; ++at) {
-            if (current[at] == original[at] || (keepGuest && destination[at] != original[at])) continue;
+            if (current[at] == original[at]) continue;
+            if (keepGuest && destination[at] != original[at]) {
+                firstConflict = std::min(firstConflict, at);
+                ++conflictBytes;
+                continue;
+            }
             destination[at] = current[at];
             firstChanged = std::min(firstChanged, at);
             lastChanged = std::max(lastChanged, at + 1);
         }
         return firstChanged < lastChanged ? std::pair<std::uint64_t, std::uint64_t>{address + firstChanged, address + lastChanged} : std::pair<std::uint64_t, std::uint64_t>{0, 0};
     });
+    static const bool traceConflicts = std::getenv("APS5_TRACE_COPYBACK_CONFLICT") != nullptr;
+    static std::atomic<std::uint64_t> conflictReports{0};
+    if (traceConflicts && conflictBytes != 0) {
+        const auto report = conflictReports.fetch_add(1, std::memory_order_relaxed);
+        if (report < 256) std::fprintf(stderr, "[copyback-conflict] report=%llu address=0x%llx first=0x%zx bytes=%zu range=%zu\n", static_cast<unsigned long long>(report + 1), static_cast<unsigned long long>(address), firstConflict, conflictBytes, size);
+    }
 }
 
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment) {

@@ -26,6 +26,7 @@ void main() {
     if (index >= parameters.count) return;
     uint value = parameters.result.words[index];
     uint before = parameters.snapshot.words[index];
+    if (parameters.always == 0u && value == before) return;
     uint held = parameters.target.words[index];
     uint changed = differingBytes(value ^ before);
     uint kept = differingBytes(held ^ before);

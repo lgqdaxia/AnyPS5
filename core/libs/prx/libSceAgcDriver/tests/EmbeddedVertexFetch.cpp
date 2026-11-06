@@ -85,6 +85,95 @@ int NoCarryOffsets() {
     return failures;
 }
 
+int IndexProvenance() {
+    const std::array<std::uint32_t, 10> code{
+        0x4a0a0a1fu, 0x4a101011u,
+        0xf4080506u, 0xfa000000u,
+        0x02060b08u,
+        0xbf8cc07fu,
+        0xe0002000u, 0x80050a03u,
+        0xbf8c3f70u, 0xbf810000u,
+    };
+    const auto decoded = RdnaInstructionDecoder{}.Decode(code);
+    const auto prefixed = [&](const RdnaInstruction& prefix) {
+        auto program = decoded;
+        program.instructions.insert(program.instructions.begin(), prefix);
+        std::uint32_t pc = 0u;
+        for (auto& instruction : program.instructions) {
+            instruction.programCounter = pc;
+            pc += instruction.wordCount * 4u;
+        }
+        return program;
+    };
+    RdnaInstruction scalarLoad{};
+    scalarLoad.op = RdnaOpcode::SBufferLoadDwordx4;
+    scalarLoad.family = RdnaInstructionFamily::SMEM;
+    scalarLoad.destination.kind = RdnaOperandKind::ScalarRegister;
+    scalarLoad.destination.reg = 28u;
+    scalarLoad.source0.kind = RdnaOperandKind::ScalarRegister;
+    scalarLoad.source0.reg = 0u;
+    scalarLoad.dataDwordCount = 4u;
+    scalarLoad.wordCount = 2u;
+    RdnaInstruction snapshot{};
+    snapshot.op = RdnaOpcode::VMovB32;
+    snapshot.family = RdnaInstructionFamily::VOP1;
+    snapshot.destination.kind = RdnaOperandKind::VectorRegister;
+    snapshot.destination.reg = 1u;
+    snapshot.source0.kind = RdnaOperandKind::VectorRegister;
+    snapshot.source0.reg = 5u;
+    RdnaInstruction exec{};
+    exec.op = RdnaOpcode::SLshrB64;
+    exec.family = RdnaInstructionFamily::SOP2;
+    exec.destination.kind = RdnaOperandKind::ExecLo;
+    exec.source0.kind = RdnaOperandKind::IntegerInlineConstant;
+    exec.source0.value = 0xffffffffu;
+    exec.source0.signedVal = -1;
+    exec.source1.kind = RdnaOperandKind::VccLo;
+    exec.is64Bit = true;
+    int failures = 0;
+    for (const auto wave : {32u, 64u}) {
+        const auto analyze = [&](const RdnaProgram& program) { return EmbeddedVertexFetchAnalyzer{}.Analyze(program, 6, 4, 8, 30, wave); };
+        const auto admitted = [&](const char* label, const RdnaProgram& program, bool observed = false) {
+            const auto plan = analyze(program);
+            if (plan.loads.size() == 1u && plan.vertexOffsetSgpr == 31 && plan.instanceOffsetSgpr == 17 && plan.vertexIndexObserved == observed) return;
+            std::fprintf(stderr, "wave%u: index provenance rejected %s: loads=%zu vertex=%d instance=%d observed=%d\n", wave, label, plan.loads.size(), plan.vertexOffsetSgpr, plan.instanceOffsetSgpr, plan.vertexIndexObserved);
+            ++failures;
+        };
+        const auto rejected = [&](const char* label, const RdnaProgram& program) {
+            const auto plan = analyze(program);
+            if (plan.loads.empty() && plan.vertexOffsetSgpr == -1 && plan.instanceOffsetSgpr == -1) return;
+            std::fprintf(stderr, "wave%u: index provenance admitted %s: loads=%zu vertex=%d instance=%d\n", wave, label, plan.loads.size(), plan.vertexOffsetSgpr, plan.instanceOffsetSgpr);
+            ++failures;
+        };
+        admitted("valid initial user offsets", decoded);
+        rejected("a stale entry SGPR after an overlapping four-DWORD load", prefixed(scalarLoad));
+        auto adjacentLoad = scalarLoad;
+        adjacentLoad.destination.reg = 32u;
+        admitted("an adjacent four-DWORD load", prefixed(adjacentLoad));
+        admitted("a pre-add vertex-index snapshot", prefixed(snapshot), true);
+        auto preAddFetch = std::vector<std::uint32_t>(code.begin(), code.end());
+        const auto indexSnapshot = preAddFetch[4];
+        preAddFetch.erase(preAddFetch.begin() + 4);
+        preAddFetch.insert(preAddFetch.begin(), indexSnapshot);
+        rejected("a fetch using a pre-add index snapshot", RdnaInstructionDecoder{}.Decode(preAddFetch));
+        rejected("an EXEC shift before the fetch", prefixed(exec));
+        auto fullExec = exec;
+        fullExec.op = RdnaOpcode::SMovB64;
+        fullExec.family = RdnaInstructionFamily::SOP1;
+        fullExec.source1 = {};
+        admitted("an all-ones EXEC initialization", prefixed(fullExec));
+        for (const auto status : {0x00010000u, 0x00020000u}) {
+            RdnaInstruction image{};
+            image.op = RdnaOpcode::ImageLoad;
+            image.family = RdnaInstructionFamily::MIMG;
+            image.wordCount = 2u;
+            image.rawWords[0] = status;
+            rejected("an image-status prefix", prefixed(image));
+        }
+    }
+    return failures;
+}
+
 }
 
 int main() {
@@ -94,5 +183,6 @@ int main() {
     failures += Expect("width 0", 0x00000320u, 0x00000000u, 0u);
     failures += Expect("width above 32", 0x00000320u, 0x007f0000u, 0x320u);
     failures += NoCarryOffsets();
+    failures += IndexProvenance();
     return failures == 0 ? 0 : 1;
 }

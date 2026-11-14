@@ -760,6 +760,11 @@ std::size_t storageEntries() {
 }
 
 std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
+    static const std::uint64_t forcedSampled = [] {
+        const char* text = std::getenv("APS5_SAMPLED_TEXTURE_CACHE_MIB");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) << 20u : 0u;
+    }();
+    if (forcedSampled != 0) return forcedSampled;
     if (const auto forced = forcedCacheBudget(); forced != 0) return forced;
     if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return TextureCacheBudget(context.memory);
     const auto now = std::chrono::steady_clock::now();

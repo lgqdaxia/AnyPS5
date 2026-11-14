@@ -1460,11 +1460,12 @@ int main(int argc, char** argv) {
         const bool sampledBudgetOnly = mode == "sampled-budget-only";
 #ifdef _WIN32
         if (!memory && mode != "budget-report-age") _putenv_s("APS5_TEXTURE_CACHE_MIB", recover || sampledBudgetOnly ? "16" : "1");
-        if (sampledBudgetOnly) _putenv_s("APS5_SAMPLED_TEXTURE_CACHE_MIB", "1");
+        _putenv_s("APS5_SAMPLED_TEXTURE_CACHE_MIB", sampledBudgetOnly ? "1" : "");
         if (std::getenv("APS5_TEMPLATE_AUDIT_MS") == nullptr) _putenv_s("APS5_TEMPLATE_AUDIT_MS", "250");
 #else
         if (!memory && mode != "budget-report-age") setenv("APS5_TEXTURE_CACHE_MIB", recover || sampledBudgetOnly ? "16" : "1", 1);
         if (sampledBudgetOnly) setenv("APS5_SAMPLED_TEXTURE_CACHE_MIB", "1", 1);
+        else unsetenv("APS5_SAMPLED_TEXTURE_CACHE_MIB");
         setenv("APS5_TEMPLATE_AUDIT_MS", "250", 0);
 #endif
         std::unique_ptr<Device> device;

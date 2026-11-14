@@ -161,6 +161,13 @@ struct TextureKeyHash {
     }
 };
 
+struct TextureDescriptorHash {
+    std::size_t operator()(TextureKey key) const noexcept {
+        key.allocation = {};
+        return TextureKeyHash{}(key);
+    }
+};
+
 TextureKey MakeTextureKey(VkDevice device, std::span<const std::uint32_t> words, VkComponentMapping components, bool depthCompare = false) {
     TextureKey key{device, {}, {static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a)}};
     key.depthCompare = depthCompare;
@@ -207,7 +214,7 @@ struct CachedTexture {
 struct TextureCache {
     AgcDriver::Mutex mutex;
     std::list<CachedTexture> entries;
-    std::unordered_map<TextureKey, std::list<CachedTexture>::iterator, TextureKeyHash> index;
+    std::unordered_map<TextureKey, std::list<CachedTexture>::iterator, TextureDescriptorHash> index;
     std::unordered_multimap<const StorageTexture*, std::list<CachedTexture>::iterator> views;
     std::vector<std::pair<std::vector<std::byte>, std::uint64_t>> spare;
     std::uint64_t spareBytes = 0;
@@ -1274,6 +1281,16 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         else parkSnapshot(cache, it->bytes);
         eraseTexture(cache, it);
         ++cache.counts.stale;
+    }
+    if (key.allocation.backingSerial != 0 && !cache.index.empty()) {
+        const auto bucket = cache.index.bucket(key);
+        for (auto it = cache.index.begin(bucket); it != cache.index.end(bucket);) {
+            const auto previous = it++;
+            auto descriptor = previous->first;
+            if (descriptor.allocation.backingSerial == 0 || descriptor.allocation.backingSerial == key.allocation.backingSerial) continue;
+            descriptor.allocation = key.allocation;
+            if (descriptor == key) eraseTexture(cache, previous->second);
+        }
     }
     const auto clear = source == nullptr ? SampledClearColor(context, resource, *keys, depthCompare) : std::nullopt;
     static const bool sampledImport = std::getenv("APS5_NO_SAMPLED_IMPORT") == nullptr;

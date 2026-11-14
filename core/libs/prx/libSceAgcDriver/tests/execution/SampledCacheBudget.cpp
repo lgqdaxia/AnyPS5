@@ -619,6 +619,102 @@ ShaderRecompiler::RecompileResult SampledProgram(std::uint64_t address) {
     return program;
 }
 
+PFN_vkGetDeviceProcAddr identityDeviceProc = nullptr;
+VkImage identityImage = VK_NULL_HANDLE;
+
+VkResult VKAPI_PTR identityCreateImage(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* callbacks, VkImage* image) {
+    auto readable = *info;
+    readable.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    const auto result = reinterpret_cast<PFN_vkCreateImage>(identityDeviceProc(device, "vkCreateImage"))(device, &readable, callbacks, image);
+    if (result == VK_SUCCESS) identityImage = *image;
+    return result;
+}
+
+PFN_vkVoidFunction VKAPI_PTR identityDeviceFunction(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkCreateImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(identityCreateImage);
+    return identityDeviceProc(device, name);
+}
+
+void allocationIdentityTests(Context context) {
+    ClearCachedTextures(context.device);
+    identityDeviceProc = context.deviceProc;
+    context.deviceProc = identityDeviceFunction;
+    WatchedSurface surface(context, 2u * SurfaceBytes);
+    auto first = Sampled(context, surface.Address());
+    const auto firstImage = identityImage;
+    const auto firstLayout = first->Layout();
+    Require(firstImage != VK_NULL_HANDLE && !first->ViewsStorageImage() && 3u * first->AllocationBytes() <= Budget, "allocation identity fixture needs three snapshot textures below its budget");
+    const auto original = *GuestAllocations::GuestAllocationsLookup_nid_postfix(surface.Address(), false);
+    GuestAllocations::Mutation().Protect(reinterpret_cast<void*>(surface.Address() + SurfaceBytes), SurfaceBytes, true, false, true, [] {});
+    const auto split = *GuestAllocations::GuestAllocationsLookup_nid_postfix(surface.Address(), false);
+    Require(original.backingSerial != 0 && split.backingSerial == original.backingSerial && split.bytes != original.bytes, "allocation identity fixture did not split geometry with the same backing serial");
+    auto sameBacking = Sampled(context, surface.Address());
+    Require(sameBacking != first && TextureCacheUsage().sampledEntries == 2, "same-serial geometry change retired a sampled cache entry");
+    const std::weak_ptr<Texture> previous = first;
+    const std::weak_ptr<Texture> splitOwner = sameBacking;
+    std::shared_ptr<Texture> replacement;
+    Buffer readback(context, 2u * sizeof(std::uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        recorder.Commands();
+        recorder.Keep(first);
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(reinterpret_cast<void*>(surface.Address()));
+            mutation.Add(reinterpret_cast<void*>(surface.Address()), 2u * SurfaceBytes, true, true, true);
+        }
+        const auto renewed = *GuestAllocations::GuestAllocationsLookup_nid_postfix(surface.Address(), false);
+        Require(renewed.backingSerial != 0 && renewed.backingSerial != original.backingSerial, "same-address registration retained its old backing serial");
+        std::memset(reinterpret_cast<void*>(surface.Address()), 0x3c, SurfaceBytes);
+        replacement = Sampled(context, surface.Address());
+        const auto replacementImage = identityImage;
+        Require(replacement != first && replacement != sameBacking && replacementImage != firstImage, "same-address registration reused its old sampled texture");
+        Require(TextureCacheUsage().sampledEntries == 1 && TextureCacheUsage().sampledBytes == replacement->AllocationBytes(), "sampled cache retained obsolete backing identities below its budget");
+        Require(!previous.expired(), "identity retirement destroyed an externally held texture");
+        sameBacking.reset();
+        Require(splitOwner.expired(), "identity retirement retained an unused old cache owner");
+        const auto commands = recorder.Commands();
+        const auto copy = [&](VkImage image, VkImageLayout layout, VkDeviceSize offset) {
+            VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barrier.oldLayout = layout;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = image;
+            barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            const auto pipelineBarrier = context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+            pipelineBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+            VkBufferImageCopy region{};
+            region.bufferOffset = offset;
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageExtent = {1, 1, 1};
+            context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.Handle(), 1, &region);
+            std::swap(barrier.oldLayout, barrier.newLayout);
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            pipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        };
+        copy(firstImage, firstLayout, 0);
+        copy(replacementImage, replacement->Layout(), sizeof(std::uint32_t));
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(replacement);
+        recorder.Submit();
+        first.reset();
+        Require(!previous.expired(), "identity retirement destroyed a texture kept by an in-flight recorder");
+        recorder.Sync();
+        std::array<std::uint32_t, 2> pixels{};
+        std::memcpy(pixels.data(), readback.Bytes().data(), sizeof(pixels));
+        Require(pixels[0] == 0x5a5a5a5a && pixels[1] == 0x3c3c3c3c, "identity retirement changed the old or replacement sampled pixels");
+    }
+    Require(previous.expired(), "retired sampled identity outlived its completed recorder");
+    Require(Sampled(context, surface.Address()) == replacement, "identity retirement removed the current sampled texture");
+    replacement.reset();
+    ClearCachedTextures(context.device);
+}
+
 void replacedEntryTests(Context context) {
     PlaceholderImages placeholders(context);
     context.placeholderImages = &placeholders;
@@ -1566,6 +1662,7 @@ int main(int argc, char** argv) {
         if (mode == "resource-replaced") {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             replacedEntryTests(context);
+            allocationIdentityTests(context);
             std::puts("resource cache replaced entry tests passed");
             return 0;
         }

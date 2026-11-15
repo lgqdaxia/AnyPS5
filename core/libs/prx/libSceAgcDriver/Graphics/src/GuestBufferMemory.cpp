@@ -6903,6 +6903,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
     takeHeapReferences();
     ResidentBuffer::FlushChanged(context);
+    for (auto& region : regions) if (region.snapshot.empty() && region.snapshot.capacity() != 0) std::vector<std::byte>{}.swap(region.snapshot);
     if (!profile) return;
     const auto loopUs = microsecondsSince(loopStart);
     readUs.fetch_add(refreshUs, std::memory_order_relaxed);

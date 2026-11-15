@@ -487,6 +487,11 @@ void FullVertexPushDataLeavesRoomForTheFragment(bool libraries) {
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    _putenv_s("APS5_NO_GPU_UNFOLDED_INDIRECT", "1");
+#else
+    setenv("APS5_NO_GPU_UNFOLDED_INDIRECT", "1", 1);
+#endif
     try {
         SightingsKeepCollidingKeys();
         bool libraries = false;

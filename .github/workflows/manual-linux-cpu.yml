@@ -1,0 +1,116 @@
+name: Manual Linux CPU verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact source commit to build
+        type: string
+        required: true
+        default: 8378a3d27c0a64b0265ab9a7809ea1b9744e7573
+      target:
+        description: Single CMake test target
+        type: string
+        required: true
+        default: agc_mapped_copy_tests
+      test_regex:
+        description: Focused CTest selection
+        type: string
+        required: true
+        default: '^agc_mapped_copy_'
+      expected_count:
+        description: Expected number of tests without skips
+        type: number
+        required: true
+        default: 7
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    env:
+      SOURCE_REF: ${{ inputs.source_ref }}
+      BUILD_TARGET: ${{ inputs.target }}
+      TEST_REGEX: ${{ inputs.test_regex }}
+      EXPECTED_COUNT: ${{ inputs.expected_count }}
+      CCACHE_DISABLE: '1'
+      ANYPS5_NO_SHADER_CACHE: '1'
+    steps:
+      - name: Validate the manual selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re
+          assert re.fullmatch(r'[0-9a-f]{40}', os.environ['SOURCE_REF'])
+          assert re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.+-]*', os.environ['BUILD_TARGET'])
+          assert 1 <= int(os.environ['EXPECTED_COUNT']) <= 200
+          assert os.environ['TEST_REGEX']
+          PY
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+          submodules: recursive
+      - name: Record source and native toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_REF"
+          git status --short
+          uname -a
+          cat /etc/os-release
+          gcc --version
+          g++ --version
+          cmake --version
+          ldd --version
+          free -h
+          df -h .
+      - name: Install platform build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build pkg-config libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxinerama-dev libxi-dev libxss-dev libxfixes-dev libwayland-dev wayland-protocols libxkbcommon-dev libegl-dev libgl-dev libdecor-0-dev libdrm-dev libgbm-dev libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libvulkan-dev
+      - name: Configure the real project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER_LAUNCHER= -DCMAKE_CXX_COMPILER_LAUNCHER= -DANYPS5_ENABLE_SPIRV_TOOLS=OFF -DANYPS5_AGC_EXECUTION_TESTS=RegistrationPrepareShutdown
+      - name: Build the selected test target
+        shell: bash
+        run: |
+          set -euo pipefail
+          jobs=$(python3 -c 'import os; m=int(next(x.split()[1] for x in open("/proc/meminfo") if x.startswith("MemAvailable:")))//1024; print(max(1,min(3,os.cpu_count(),(m-2048)//2048)))')
+          echo "Building $BUILD_TARGET with $jobs compiler jobs"
+          timeout --signal=TERM --kill-after=15s 35m cmake --build build --target "$BUILD_TARGET" --parallel "$jobs"
+      - name: Run the focused CPU tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -R "$TEST_REGEX" --show-only=json-v1 > "$RUNNER_TEMP/selected-tests.json"
+          python3 - <<'PY'
+          import json, os
+          path = os.path.join(os.environ['RUNNER_TEMP'], 'selected-tests.json')
+          tests = json.load(open(path))['tests']
+          assert len(tests) == int(os.environ['EXPECTED_COUNT'])
+          print('Selected tests:', ', '.join(t['name'] for t in tests))
+          PY
+          ctest --test-dir build -R "$TEST_REGEX" -V -j 1 --no-tests=error --output-junit "$RUNNER_TEMP/test-results.xml"
+          python3 - <<'PY'
+          import hashlib, json, os, xml.etree.ElementTree as ET
+          base = os.environ['RUNNER_TEMP']
+          selection = json.load(open(os.path.join(base, 'selected-tests.json')))['tests']
+          root = ET.parse(os.path.join(base, 'test-results.xml')).getroot()
+          cases = list(root.iter('testcase'))
+          assert sorted(c.get('name') for c in cases) == sorted(t['name'] for t in selection)
+          assert not list(root.iter('failure')) and not list(root.iter('error')) and not list(root.iter('skipped'))
+          for binary in sorted({t['command'][0] for t in selection}):
+              with open(binary, 'rb') as f: print('TEST_BINARY_SHA256', hashlib.file_digest(f, 'sha256').hexdigest(), binary)
+          print('LINUX_CPU_RESULT:', len(cases), 'passed, 0 failed, 0 skipped')
+          PY
+          git diff --exit-code
+          git diff --cached --exit-code

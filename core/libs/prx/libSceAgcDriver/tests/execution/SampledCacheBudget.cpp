@@ -635,7 +635,7 @@ PFN_vkVoidFunction VKAPI_PTR identityDeviceFunction(VkDevice device, const char*
     return identityDeviceProc(device, name);
 }
 
-void allocationIdentityTests(Context context) {
+void replacedBackingIdentityTests(Context context) {
     ClearCachedTextures(context.device);
     identityDeviceProc = context.deviceProc;
     context.deviceProc = identityDeviceFunction;
@@ -1662,7 +1662,7 @@ int main(int argc, char** argv) {
         if (mode == "resource-replaced") {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             replacedEntryTests(context);
-            allocationIdentityTests(context);
+            replacedBackingIdentityTests(context);
             std::puts("resource cache replaced entry tests passed");
             return 0;
         }

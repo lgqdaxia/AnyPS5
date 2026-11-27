@@ -2421,6 +2421,43 @@ std::uint64_t mixBindlessInterface(std::uint64_t hash, const ImageResource& imag
     mix(static_cast<std::uint64_t>(image.packedFormat));
     mix(image.emulatedCompare);
     mix(static_cast<std::uint64_t>(image.tableOperation));
+    const bool hasOverwrite = image.overwrite != ImageOverwrite{};
+    const auto imageFlags =
+        (std::uint32_t{image.volumeArraySampleCompatible} << 0u) |
+        (std::uint32_t{image.adjustedSample} << 1u) |
+        (std::uint32_t{image.dimensionQueryOnly} << 2u) |
+        (std::uint32_t{image.sampledOnly} << 3u) |
+        (std::uint32_t{image.convertedSamples} << 4u) |
+        (std::uint32_t{image.remappedDepth1D} << 5u) |
+        (std::uint32_t{image.gathered} << 6u) |
+        (std::uint32_t{image.layerRowsCompatible} << 7u) |
+        (std::uint32_t{image.layerRows} << 8u) |
+        (std::uint32_t{image.optionalDescriptor} << 9u) |
+        (std::uint32_t{image.volumeGather} << 10u) |
+        (std::uint32_t{image.nestedTable} << 11u) |
+        (std::uint32_t{image.targetMerge} << 12u) |
+        (std::uint32_t{hasOverwrite} << 13u);
+    mix(imageFlags);
+    mix(image.maxArrayLayers);
+    if (hasOverwrite) {
+        mix(image.overwrite.proved);
+        mix(image.overwrite.fullGroups);
+        for (const auto& axis : image.overwrite.axes) {
+            mix(axis.groupAxis);
+            mix(axis.tile);
+            mix(axis.offsetRegister);
+            mix(axis.boundRegister);
+            mix(axis.boundImmediate);
+            mix(axis.maxLane);
+        }
+        for (const auto& range : image.overwrite.ranges) {
+            mix(range.groupAxis);
+            mix(range.scale);
+            mix(static_cast<std::uint32_t>(range.minLane));
+            mix(static_cast<std::uint32_t>(range.maxLane));
+            mix(range.bits);
+        }
+    }
     return hash;
 }
 

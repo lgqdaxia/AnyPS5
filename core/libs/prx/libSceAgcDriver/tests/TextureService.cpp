@@ -1110,6 +1110,54 @@ std::array<std::uint32_t, 8> GuestDescriptor(std::uint64_t address, std::uint32_
     };
 }
 
+void interfaceIdentityTests() {
+    using namespace ShaderRecompiler;
+    ImageResource image{};
+    image.resourceClass = ImageResourceClass::Sampled;
+    image.read = true;
+    image.table = 0u;
+    const std::array modes{image};
+    const auto original = ResourceMaterializer::RegisterBindlessInterface(image, modes);
+    auto relocated = image;
+    relocated.source = 9u;
+    relocated.firstUsePc = 0x80u;
+    relocated.table = 4u;
+    Require(ResourceMaterializer::RegisterBindlessInterface(relocated, std::array{relocated}) == original, "relocating a bindless interface changed its ID");
+
+    const auto check = [&](const ImageResource& variant) {
+        const auto sourceId = ResourceMaterializer::RegisterBindlessInterface(variant, modes);
+        const auto modeId = ResourceMaterializer::RegisterBindlessInterface(image, std::array{variant});
+        Require(sourceId != original && modeId != original && sourceId != modeId, "a source or mode variant reused a bindless interface ID");
+        const auto source = ResourceMaterializer::FindBindlessInterface(sourceId);
+        const auto mode = ResourceMaterializer::FindBindlessInterface(modeId);
+        Require(source && source->image == variant && source->modes.size() == 1u && source->modes[0] == image, "the source interface lookup lost its metadata");
+        Require(mode && mode->image == image && mode->modes.size() == 1u && mode->modes[0] == variant, "the mode interface lookup lost its metadata");
+    };
+    for (const auto flag : {
+        &ImageResource::volumeArraySampleCompatible, &ImageResource::adjustedSample, &ImageResource::dimensionQueryOnly,
+        &ImageResource::sampledOnly, &ImageResource::convertedSamples, &ImageResource::remappedDepth1D,
+        &ImageResource::gathered, &ImageResource::layerRowsCompatible, &ImageResource::layerRows,
+        &ImageResource::optionalDescriptor, &ImageResource::volumeGather, &ImageResource::nestedTable, &ImageResource::targetMerge,
+    }) {
+        auto variant = image;
+        variant.*flag = !(variant.*flag);
+        check(variant);
+    }
+    auto layered = image;
+    layered.maxArrayLayers = 32u;
+    check(layered);
+
+    auto overwritten = image;
+    overwritten.overwrite.proved = true;
+    check(overwritten);
+    overwritten.overwrite.fullGroups = 2u;
+    check(overwritten);
+    overwritten.overwrite.axes[1].tile = 16u;
+    check(overwritten);
+    overwritten.overwrite.ranges[3].minLane = -2;
+    check(overwritten);
+}
+
 void driverTests(const Device& device) {
     using ShaderRecompiler::ResourceMaterializer;
     auto context = device.GetContext();
@@ -1372,6 +1420,7 @@ int main(int argc, char** argv) {
             return Skipped;
         }
         if (mode == "--driver") {
+            interfaceIdentityTests();
             driverTests(*device);
             r128Tests(*device);
             return 0;

@@ -5305,6 +5305,57 @@ void verifyImageTableScratchReuse() {
     require(warm.allocations < Entries / 4u, "image table scratch: snapshotting and resolving a table allocated per record");
 }
 
+void verifyIndirectImageTableKeys() {
+    using namespace ShaderRecompiler;
+    namespace Abi = ImageTableAbi;
+    alignas(4096) static TableGuest guest;
+    alignas(4096) static std::array<std::uint32_t, 2048> materials{};
+    static TableTexture texture;
+    for (std::uint32_t i = 0; i < 4u; ++i) guest.heap[i] = TableT(texture.bytes.data(), TableFormat8888UNorm, TableType2D, i + 1u);
+    guest.materials = {{{0u, 16u, 0u, 0u}, {0u, 32u, 0u, 0u}, {0u, 0xffffffffu, 0u, 0u}}};
+    materials[4] = 80u;
+    materials[8] = 160u;
+    materials[22] = 1u;
+    materials[42] = 3u;
+    materials[333] = 2u;
+    FillTableSrt(guest, guest.heap.data(), 32u, 4u);
+    const auto materialBuffer = TableV(materials.data(), 4u, materials.size());
+    std::copy(materialBuffer.begin(), materialBuffer.end(), guest.srt.begin() + 16);
+    auto code = TableMaterialCode;
+    code.insert(code.begin() + 8, {0xf4080900u, 0xfa000040u});
+    const auto load = std::find(code.begin(), code.end(), 0xf4200406u);
+    require(load != code.end(), "indirect table keys: missing material load in the fixture");
+    code.insert(load + 2, {0xf4200412u, 0x20000000u, 0xf4200412u, 0x20000008u});
+    const auto userData = TableUserData(guest);
+    const auto request = TableRequest(code, userData);
+    const auto outside = Abi::PoisonCode(static_cast<std::uint32_t>(Abi::PoisonReason::OutsideDomain));
+    const auto selected = [&](const auto& snapshot, std::uint32_t key) { return snapshot.tables.tables.at(0).codes.at(key) != outside; };
+    const auto first = CaptureTable(request);
+    require(selected(first->snapshot, 0) && selected(first->snapshot, 1) && !selected(first->snapshot, 2) && selected(first->snapshot, 3), "indirect table keys: the table includes an unreachable key or omits a reachable key");
+    materials[22] = 2u;
+    const auto changed = CaptureTable(request);
+    require(!selected(changed->snapshot, 1) && selected(changed->snapshot, 2), "indirect table keys: a changed intermediate result left stale keys");
+    const auto field = reinterpret_cast<std::uintptr_t>(&materials[22]);
+    CountingMemory memory{field, field + 4u};
+    SrtRuntime runtime;
+    runtime.userData = request.context.userData;
+    runtime.shaderBase = request.shader.codeAddress;
+    runtime.userContext = &memory;
+    runtime.readMemory = &CountingRead;
+    runtime.readSpecializationMemory = &CountingRead;
+    runtime.accessible = &CountingAccessible;
+    runtime.pendingWrite = [](void* context, std::uint64_t address, std::uint64_t bytes) {
+        const auto& pending = *static_cast<const CountingMemory*>(context);
+        return address < pending.end && pending.begin < address + bytes;
+    };
+    const auto pending = CaptureResources(request, runtime);
+    require(selected(pending->snapshot, 1), "indirect table keys: a pending GPU write narrowed the table");
+    const auto alias = TableV(&materials[22], 0u, 4u);
+    std::copy(alias.begin(), alias.end(), guest.srt.begin() + 12);
+    const auto writable = CaptureTable(request);
+    require(selected(writable->snapshot, 1), "indirect table keys: a writable alias narrowed the table");
+}
+
 void verifyImageTableBulkKeyScan() {
     using namespace ShaderRecompiler;
     namespace Abi = ImageTableAbi;
@@ -13681,6 +13732,7 @@ int main(int argc, char** argv) {
             verifyImageTableBulkReads();
             verifyImageTableScratchReuse();
             verifyImageTableBulkKeyScan();
+            verifyIndirectImageTableKeys();
             verifyImageTableSrtKey();
             verifyImageTableMaskedOffset();
             verifyImageTableFirstLaneScale();

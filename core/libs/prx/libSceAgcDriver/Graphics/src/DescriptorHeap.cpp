@@ -103,25 +103,28 @@ void DescriptorHeap::writeHeader(const View& target) {
     context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, 1, &update, 0, nullptr);
 }
 
+DescriptorHeap::LayoutDescription DescriptorHeap::DescribeLayout(VkShaderStageFlags stages) const {
+    LayoutDescription description;
+    for (std::size_t index = 0; index < arrays.size(); ++index) {
+        description.bindings[index] = {static_cast<std::uint32_t>(index), arrays[index].type, arrays[index].capacity, stages, nullptr};
+        description.bindingFlags[index] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    }
+    description.bindings.back() = {Abi::HeaderBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, stages, nullptr};
+    return description;
+}
+
 const DescriptorHeap::View& DescriptorHeap::view(VkShaderStageFlags stages) {
     for (const auto& item : views) {
         if (item.stages == stages) return item;
     }
     Require(views.size() < MaxViews, "the descriptor heap has a view for every one of " + std::to_string(MaxViews) + " stage combinations");
     View created{stages, VK_NULL_HANDLE, VK_NULL_HANDLE};
-    std::array<VkDescriptorSetLayoutBinding, static_cast<std::size_t>(Array::Count) + 1u> bindings{};
-    std::array<VkDescriptorBindingFlags, static_cast<std::size_t>(Array::Count) + 1u> flags{};
-    for (std::size_t index = 0; index < arrays.size(); ++index) {
-        bindings[index] = {static_cast<std::uint32_t>(index), arrays[index].type, arrays[index].capacity, stages, nullptr};
-        flags[index] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
-    }
-    bindings.back() = {Abi::HeaderBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, stages, nullptr};
-    flags.back() = 0;
+    const auto [bindings, flags] = DescribeLayout(stages);
     VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlags{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
     bindingFlags.bindingCount = static_cast<std::uint32_t>(flags.size());
     bindingFlags.pBindingFlags = flags.data();
     VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, &bindingFlags};
-    layoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+    layoutInfo.flags = LayoutDescription::Flags;
     layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
     layoutInfo.pBindings = bindings.data();
     Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &layoutInfo, nullptr, &created.layout), "vkCreateDescriptorSetLayout descriptor heap");

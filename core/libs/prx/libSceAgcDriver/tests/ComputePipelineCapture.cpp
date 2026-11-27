@@ -148,12 +148,18 @@ void CheckBindingFlags() {
     changed.sets[0].bindings[1].flags |= VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
     Reject([&] { changed.Encode(); }, "non-highest variable descriptor binding accepted");
     changed = capture;
-    changed.sets[0].bindings[0].flags |= VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+    changed.sets[0].bindings[0].flags |= 1u << 31u;
     Reject([&] { changed.Encode(); }, "unsupported binding flags accepted");
     capture.sets[0].flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
     capture.sets[0].bindings[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     capture.sets[0].bindings[0].flags |= VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
     Require(AgcDriver::ComputePipelineCapture::Decode(capture.Encode()).Encode() == capture.Encode(), "combined binding flags changed");
+    capture.sets.resize(5);
+    auto& heap = capture.sets.back();
+    heap.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+    heap.bindings.push_back({2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16, VK_SHADER_STAGE_COMPUTE_BIT, VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT});
+    const auto heapBytes = capture.Encode();
+    Require(AgcDriver::ComputePipelineCapture::Decode(heapBytes).Encode() == heapBytes, "descriptor heap layout did not round trip");
 }
 
 void CheckMalformedRecords() {

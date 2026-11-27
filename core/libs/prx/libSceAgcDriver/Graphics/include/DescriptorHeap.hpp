@@ -14,6 +14,11 @@ class DescriptorHeap {
 public:
     static constexpr std::uint32_t MaxViews = 16u;
     enum class Array : std::uint32_t { Samplers, SampledImages, StorageImages, Count };
+    struct LayoutDescription {
+        static constexpr auto Flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+        std::array<VkDescriptorSetLayoutBinding, static_cast<std::size_t>(Array::Count) + 1u> bindings{};
+        std::array<VkDescriptorBindingFlags, static_cast<std::size_t>(Array::Count) + 1u> bindingFlags{};
+    };
     struct Capacities {
         std::uint32_t samplers;
         std::uint32_t sampledImages;
@@ -26,6 +31,7 @@ public:
     DescriptorHeap& operator=(const DescriptorHeap&) = delete;
 
     static Capacities DeviceCapacities(const Context& context);
+    LayoutDescription DescribeLayout(VkShaderStageFlags stages) const;
     VkDescriptorSetLayout Layout(VkShaderStageFlags stages);
     VkDescriptorSetLayout EmptyLayout();
     void SetHeader(VkBuffer buffer, VkDeviceSize bytes);

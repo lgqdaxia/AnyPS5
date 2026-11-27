@@ -94,6 +94,23 @@ int main() {
                 std::printf("compute pipeline replay: descriptor binding flags 0x%x explicitly refused: %s\n", static_cast<unsigned>(flags), error.what());
             }
         }
+        auto heapCapture = decoded;
+        heapCapture.sets.resize(5);
+        auto& heapLayout = heapCapture.sets.back();
+        heapLayout.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+        const auto heapFlags = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+        heapLayout.bindings = {{0, VK_DESCRIPTOR_TYPE_SAMPLER, 4, VK_SHADER_STAGE_COMPUTE_BIT, heapFlags},
+                               {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8, VK_SHADER_STAGE_COMPUTE_BIT, heapFlags},
+                               {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4, VK_SHADER_STAGE_COMPUTE_BIT, heapFlags},
+                               {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0}};
+        try {
+            CheckResult(device->ReplayComputePipeline(heapCapture));
+            std::puts("compute pipeline replay: descriptor heap with three intervening empty sets compiled");
+        } catch (const std::exception& error) {
+            if (std::getenv("ANYPS5_REQUIRE_DESCRIPTOR_BINDING_FLAGS") != nullptr) throw;
+            const std::string_view message(error.what());
+            Require(message == "Vulkan presentation: captured descriptor sets exceed device limits" || message == "Vulkan presentation: captured update-after-bind descriptors are unsupported" || message == "Vulkan presentation: captured partially-bound descriptors are unsupported" || message == "Vulkan presentation: captured update-unused-while-pending descriptors are unsupported", "heap replay failed without an explicit feature refusal");
+        }
         auto runtimeArray = decoded;
         runtimeArray.spirv.insert(runtimeArray.spirv.begin() + 7, {0x00020011u, 5302u, 0x0008000au, 0x5f565053u, 0x5f545845u, 0x63736564u, 0x74706972u, 0x695f726fu, 0x7865646eu, 0x00676e69u});
         try {

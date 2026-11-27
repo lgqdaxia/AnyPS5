@@ -184,7 +184,7 @@ std::uint32_t DeviceMemoryLdsBytes(const RecompileRequest& request) {
 }
 
 bool BindlessLowering(const RecompileRequest& request) {
-    return request.target.bindlessImages && !(request.graphics && request.graphics->mesh);
+    return request.target.bindlessImages && (request.shader.stage == ShaderStage::Fragment || !request.graphics || !request.graphics->mesh);
 }
 
 bool HardwareFloat32Flush(const RecompileRequest& request) {

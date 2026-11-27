@@ -13,6 +13,7 @@
 #include "ImageTableAbi.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "VulkanTestDevice.hpp"
+#include "../MeshGeometryFixture.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -2824,27 +2825,44 @@ void FillSampleTextures() {
 }
 
 struct PixelDraw {
-    bool vertexHeap = false;
+    bool geometryHeap = false;
     bool pixelHeap = false;
     bool pixelTableBinding = false;
     std::uint32_t quadBroadcasts = 0;
 };
 
-PixelDraw DrawPixelTable(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelCode, std::span<const std::uint32_t> table, std::uint32_t key, const std::array<std::uint32_t, 4>& sampler, float scaleU, float scaleV) {
+PixelDraw DrawPixelTable(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelCode, std::span<const std::uint32_t> table, std::uint32_t key, const std::array<std::uint32_t, 4>& sampler, float scaleU, float scaleV, bool mesh = false) {
     const auto target = device.Target();
     std::fill(Pixels.begin(), Pixels.end(), std::byte{0xa5});
-    std::vector<std::uint32_t> vertexUserData(4, 0u);
-    const auto vertices = VertexBuffer(Triangle.data(), 16u, static_cast<std::uint32_t>(Triangle.size()));
-    std::copy(vertices.begin(), vertices.end(), vertexUserData.begin());
-    const std::array<ShaderRecompiler::MemoryRegion, 1> vertexMemory{{{reinterpret_cast<std::uintptr_t>(PlainVertexCode.data()), std::as_bytes(std::span(PlainVertexCode))}}};
-    ShaderRecompiler::RecompileRequest vertex{
-        {ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(PlainVertexCode.data()), PlainVertexCode, 0, {}},
-        {64, 0, vertexUserData, std::nullopt, std::nullopt, ShaderRecompiler::ShaderVertexStageInfo{}, vertexMemory},
+    constexpr ShaderRecompiler::MeshConfiguration subgroup{4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u};
+    alignas(256) static constexpr auto meshVertices = [] {
+        std::array<std::array<float, 8>, Triangle.size()> vertices{};
+        for (std::size_t i = 0; i < vertices.size(); ++i) std::ranges::copy(Triangle[i], vertices[i].begin());
+        return vertices;
+    }();
+    alignas(256) static constexpr auto meshCode = [] {
+        const auto& geometry = AgcDriver::Test::MeshGeometryCode;
+        std::array<std::uint32_t, AgcDriver::Test::MeshGeometryCode.size() + 2u> words{0xbefc0380u, 0x7e008500u};
+        std::ranges::copy(geometry, words.begin() + 2);
+        return words;
+    }();
+    const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
+    const auto vertices = mesh ? VertexBuffer(meshVertices.data(), sizeof(meshVertices[0]), draw.indexCount) : VertexBuffer(Triangle.data(), sizeof(Triangle[0]), draw.indexCount);
+    std::vector<std::uint32_t> geometryUserData(mesh ? 12u : 4u, 0u);
+    std::copy(vertices.begin(), vertices.end(), geometryUserData.begin() + (mesh ? 8 : 0));
+    const std::span<const std::uint32_t> code = mesh ? std::span<const std::uint32_t>(meshCode) : std::span<const std::uint32_t>(PlainVertexCode);
+    const auto stage = mesh ? ShaderStage::Mesh : ShaderStage::Vertex;
+    const std::array<ShaderRecompiler::MemoryRegion, 1> geometryMemory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
+    ShaderRecompiler::RecompileRequest geometry{
+        {stage, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {64, 0, geometryUserData, std::nullopt, std::nullopt, ShaderRecompiler::ShaderVertexStageInfo{}, geometryMemory},
         target,
-        {0, 0, 0, 64}
+        {0, 0, 0, mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : 64u}
     };
-    const auto vertexResult = ShaderRecompiler::Recompile(vertex);
-    const auto vertexPush = static_cast<std::uint32_t>(vertexResult.pushConstants.size());
+    if (mesh) geometry.graphics = ShaderRecompiler::GraphicsCompileContext{0, {}, subgroup, std::nullopt, {draw.indexAddress, draw.indexCount, draw.indexSize, draw.instanceCount}};
+    const auto geometryResult = ShaderRecompiler::Recompile(geometry);
+    const auto geometryPush = static_cast<std::uint32_t>(geometryResult.pushConstants.size());
+    if (mesh) Require(geometryResult.meshWindowBuffer == target.meshWindowBuffer, "mesh table sampling did not use the device's mesh register window");
     ShaderRecompiler::ShaderPixelStageInfo pixel{};
     pixel.wave32 = false;
     pixel.inputAddr = ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionX) | ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionY);
@@ -2864,17 +2882,19 @@ PixelDraw DrawPixelTable(AgcDriver::VulkanDevice& device, std::span<const std::u
         {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(pixelCode.data()), pixelCode, 0, {}},
         {64, 0, pixelUserData, std::nullopt, pixel, std::nullopt, pixelMemory},
         target,
-        PixelPushLayout(vertexPush, target)
+        PixelPushLayout(geometryPush, target),
+        geometry.graphics
     };
     const auto pixelResult = ShaderRecompiler::Recompile(fragment);
     static std::set<const std::uint32_t*> reported;
     if (reported.insert(pixelCode.data()).second) std::printf("image table pixel shader of %zu code words: %zu SPIR-V words (%s)\n", pixelCode.size(), pixelResult.spirv.size(), pixelResult.bindlessHeap ? "bindless heap" : "old table path");
     const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
-        {ShaderStage::Vertex, &vertexResult, 0},
-        {ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, target)}
+        {stage, &geometryResult, 0},
+        {ShaderStage::Fragment, &pixelResult, PixelPushOffset(geometryPush, target)}
     }};
     AgcDriver::Graphics::State state{};
-    state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, 64u, 64u, std::nullopt, std::nullopt};
+    if (mesh) state.stages = {AgcDriver::Graphics::ShaderPath::Geometry, 0x20u, 64u, 64u, subgroup, std::nullopt};
+    else state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, 64u, 64u, std::nullopt, std::nullopt};
     state.color = {reinterpret_cast<std::uintptr_t>(Pixels.data()), {TargetWidth, TargetHeight}, VK_FORMAT_R8G8B8A8_UNORM, Pixels.size(), 0xe4u};
     state.colors = {state.color};
     state.hasColorTarget = true;
@@ -2888,11 +2908,10 @@ PixelDraw DrawPixelTable(AgcDriver::VulkanDevice& device, std::span<const std::u
     state.blend.colorWriteMask = 15;
     state.blends = {state.blend};
     state.blendConstants = {};
-    const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
     device.Draw(state, draw, shaders);
     device.WaitIdle();
     PixelDraw result;
-    result.vertexHeap = vertexResult.bindlessHeap;
+    result.geometryHeap = geometryResult.bindlessHeap;
     result.pixelHeap = pixelResult.bindlessHeap;
     ForEachSpirvInstruction(pixelResult.spirv.Words(), [&](std::uint32_t opcode, std::span<const std::uint32_t>) {
         if (opcode == SpirvQuadBroadcast) ++result.quadBroadcasts;
@@ -2902,11 +2921,11 @@ PixelDraw DrawPixelTable(AgcDriver::VulkanDevice& device, std::span<const std::u
 }
 
 void RequirePixelHeap(const PixelDraw& drawn, const std::string& what, AgcDriver::VulkanDevice& device) {
+    Require(drawn.pixelHeap == BindlessHeap(), what + ": the pixel shader was " + (drawn.pixelHeap ? "" : "not ") + "lowered to the descriptor heap");
     const auto capabilities = device.Target().supportedCapabilities;
     const bool quad = std::find(capabilities.begin(), capabilities.end(), SpirvGroupNonUniformQuad) != capabilities.end();
     Require((drawn.quadBroadcasts != 0u) == (BindlessHeap() && quad), what + ": the implicit-LOD heap sample has " + std::to_string(drawn.quadBroadcasts) + " quad broadcasts");
-    Require(drawn.pixelHeap == BindlessHeap(), what + ": the pixel shader was " + (drawn.pixelHeap ? "" : "not ") + "lowered to the descriptor heap");
-    Require(!drawn.vertexHeap, what + ": the table-free vertex shader was lowered to the descriptor heap");
+    Require(!drawn.geometryHeap, what + ": the table-free geometry stage was lowered to the descriptor heap");
     Require(!BindlessHeap() || !drawn.pixelTableBinding, what + ": the heap-served pixel table kept its image table binding");
 }
 
@@ -3012,6 +3031,13 @@ void RunPixelSampleTests(AgcDriver::VulkanDevice& device) {
             RequirePixelHeap(drawn, what, device);
             RequirePixels([&](std::uint32_t x, std::uint32_t) { return std::array<std::uint32_t, 4>{SampleLevelMark(level), SampleTextureMark(base + ((x >> 2u) & 1u)), 7u, 255u}; }, what);
         }
+    }
+    if (device.Target().mesh) {
+        const auto scale = 1.0f / static_cast<float>(SampleSize);
+        const auto drawn = DrawPixelTable(device, PixelSampleWaterfallCode, SampleTable, 1u, SamplePointSampler, scale, scale, true);
+        RequirePixelHeap(drawn, "mesh table sampling", device);
+        RequirePixels([](std::uint32_t x, std::uint32_t) { return std::array<std::uint32_t, 4>{SampleLevelMark(0), SampleTextureMark(1u + ((x >> 2u) & 1u)), 7u, 255u}; }, "mesh table sampling");
+        std::printf("mesh table sampling: alternating textures passed with mesh register buffer %u and fragment heap %u\n", device.Target().meshWindowBuffer, drawn.pixelHeap);
     }
     std::puts("image table pixel sampling: implicit LOD and per-pixel textures passed");
 }

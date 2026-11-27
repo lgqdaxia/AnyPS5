@@ -934,7 +934,6 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         layoutInfo.setLayoutCount = meshWindow ? 4u : pixelLds ? 3u : resources.split ? 2u : 1u;
         heapStages = BindlessHeapStages(shaders);
         if (heapStages != 0u) {
-            Require(!meshWindow, "a draw that reads the bindless heap cannot also bind the mesh window");
             Require(context.bindlessTable != nullptr, "a bindless image draw needs the device's descriptor heap (APS5_BINDLESS_IMAGES=1 on a device that supports it)");
             auto& heap = context.bindlessTable->Heap();
             for (std::uint32_t set = 0; set < ShaderRecompiler::BindlessImageAbi::HeapDescriptorSet; ++set) {

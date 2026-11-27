@@ -141,6 +141,17 @@ namespace AgcDriver::Graphics {
         return clampsToBorder && (descriptor.borderColor == VK_BORDER_COLOR_INT_OPAQUE_BLACK || descriptor.borderColor == VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK);
     }
 
+    bool Sampler::ValidateTableBorder(const GuestSamplerResource& descriptor, std::uint32_t control) {
+        Require(!ReadsOpaqueBlackBorder(descriptor), "a sampler table entry with an opaque black border needs dynamic texture BC-swizzle pairing, which is not implemented");
+        if (descriptor.addressModeU != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER && descriptor.addressModeV != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER && descriptor.addressModeW != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER) return false;
+        for (const auto shift : {0u, 3u, 6u}) {
+            const auto clamp = (control >> shift) & 7u;
+            Require(clamp <= 3u || clamp == 6u, "a sampler table entry using half-border or mirrored-border addressing needs guest border coordinate handling, which is not implemented");
+        }
+        Require(descriptor.borderColor == VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK || descriptor.borderColor == VK_BORDER_COLOR_INT_TRANSPARENT_BLACK, "a sampler table entry with an opaque white border needs texture-format-aware border conversion, which is not implemented");
+        return true;
+    }
+
     SamplerCache::SamplerCache(std::size_t capacity) : capacity(std::max<std::size_t>(capacity, 1)) {}
 
     std::shared_ptr<Sampler> SamplerCache::Get(const Context& context, std::span<const std::uint32_t> words, bool compareEnable, bool unnormalizedProven, bool forceDegammaPaired, bool integerBorder, const std::optional<BorderComponentMapping>& borderMapping) {

@@ -964,11 +964,60 @@ void RunBorderSwizzleTests(AgcDriver::VulkanDevice& device) {
             Keys[0] = 1;
             Keys[1] = 0;
             const auto activeSampler = tableImage ? RunDirectCode(device, TableCode, PointClamp, floatImage) : RunDirectCode(device, TableSamplerCode, PointClamp, floatImage);
-            requireFault(activeSampler, "sampler table entry with a border needs dynamic texture numeric-class pairing", pair);
+            if (!BindlessHeap() || !tableImage) {
+                requireFault(activeSampler, "sampler table entry with a border needs dynamic texture numeric-class pairing", pair);
+                continue;
+            }
+            if (border != 0u) {
+                requireFault(activeSampler, "opaque white border", pair);
+                continue;
+            }
+            Require(!Faulted(activeSampler) && Group(activeSampler, 0) == Group(direct, 0), pair + ": transparent-black float sampling differs from the direct control");
+            SetRecord(0, sampler, floatImage);
+            SetRecord(1, sampler, Image(UintTexels.data(), Format32UInt));
+            const auto mixed = Run(device, TableCode, 2, Lanes, 64);
+            Require(!Faulted(mixed), pair + ": mixed float and integer sampling faulted:\n" + mixed.log);
+            RequireRed(mixed, 0, Lanes, [](std::uint32_t x) { return UintTexels[x]; }, pair + " integer texels");
+            RequireRed(mixed, 1, Lanes, [](std::uint32_t x) { return std::bit_cast<std::uint32_t>(FloatTexels[x]); }, pair + " float texels");
+            alignas(256) static constexpr auto outside = [] {
+                auto code = TableCode;
+                code[18] = std::bit_cast<std::uint32_t>(2.0f);
+                return code;
+            }();
+            const auto edge = Run(device, outside, 2, Lanes, 64);
+            Require(!Faulted(edge), pair + ": mixed transparent-black border sampling faulted:\n" + edge.log);
+            alignas(256) static constexpr auto directOutside = [] {
+                auto code = DirectCode;
+                code[12] = std::bit_cast<std::uint32_t>(2.0f);
+                return code;
+            }();
+            const auto floating = RunDirectCode(device, directOutside, sampler, floatImage);
+            const auto integer = RunDirectCode(device, directOutside, sampler, Image(UintTexels.data(), Format32UInt));
+            Require(!Faulted(floating) && !Faulted(integer), pair + ": direct border controls faulted");
+            RequireRed(floating, 0, Lanes, [](std::uint32_t) { return 0u; }, pair + " direct float border");
+            RequireRed(integer, 0, Lanes, [](std::uint32_t) { return 0u; }, pair + " direct integer border");
+            Require(Group(edge, 0) == Group(integer, 0) && Group(edge, 1) == Group(floating, 0), pair + ": border components differ from the direct controls");
+            SetRecord(1, sampler, floatImage);
         }
         const auto inactiveExec = Run(device, TableCutCode, 1, Lanes, 64);
         Require(BindlessHeap() || Holds(inactiveExec.samplerTable, sampler), name + ": the EXEC-clear border S# was not included in the snapshot");
         Require(!Faulted(inactiveExec) && std::all_of(inactiveExec.words.begin(), inactiveExec.words.end(), [](std::uint32_t word) { return word == 0xdeadbeefu; }), name + ": the EXEC-clear border S# faulted or wrote output:\n" + inactiveExec.log);
+    }
+    if (BindlessHeap()) {
+        SetRecord(0, PointClamp, floatImage);
+        for (const auto clamp : {4u, 5u, 7u}) {
+            auto sampler = opaqueBlack;
+            sampler[0] = (sampler[0] & ~7u) | clamp;
+            sampler[3] = 0u;
+            SetRecord(1, sampler, floatImage);
+            Keys[0] = 0;
+            Keys[1] = 1;
+            const auto inactive = RunDirectCode(device, TableCode, PointClamp, floatImage);
+            Require(!Faulted(inactive), "inactive half-border or mirrored-border sampler faulted");
+            Keys[0] = 1;
+            Keys[1] = 0;
+            requireFault(RunDirectCode(device, TableCode, PointClamp, floatImage), "guest border coordinate handling", "unsupported border coordinate mode " + std::to_string(clamp));
+        }
     }
 }
 

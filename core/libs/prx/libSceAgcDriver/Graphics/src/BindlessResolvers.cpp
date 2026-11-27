@@ -180,13 +180,15 @@ BindlessResolution DriverBindlessResolver::Commit(const BindlessPrepared& prepar
     resolution.perUse = texture->IsDepthCopy() || texture->RefreshedPerUse() || resolution.dcc;
     if (state->samplerClass != Heap::NoSamplerClass) {
         const bool table = state->samplerClass == Heap::TableSamplerClass;
-        const bool integerBorder = !table && state->integerBorder;
+        bool integerBorder = !table && state->integerBorder;
         auto descriptor = DecodeSamplerResource(state->sampler, false, !table, integerBorder);
         descriptor.compareEnable = state->depthCompare;
         if (table) {
             Sampler::Validate(context, descriptor);
-            Require(!Sampler::ReadsOpaqueBlackBorder(descriptor), "a sampler table entry with an opaque black border needs dynamic texture BC-swizzle pairing, which is not implemented");
-            Require(descriptor.addressModeU != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER && descriptor.addressModeV != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER && descriptor.addressModeW != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, "a sampler table entry with a border needs dynamic texture numeric-class pairing, which is not implemented");
+            if (Sampler::ValidateTableBorder(descriptor, state->sampler[0]) && state->integerImage) {
+                integerBorder = true;
+                descriptor.borderColor = VK_BORDER_COLOR_INT_TRANSPARENT_BLACK;
+            }
             Require(!descriptor.nonSeamlessCube || context.nonSeamlessCubeMap, "a sampler table entry that disables seamless cube filtering needs VK_EXT_non_seamless_cube_map because dynamic texture/sampler pairing is not implemented");
         }
         const bool border = descriptor.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER || descriptor.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER || descriptor.addressModeW == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;

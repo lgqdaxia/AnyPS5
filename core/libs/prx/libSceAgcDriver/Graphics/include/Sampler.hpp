@@ -41,6 +41,7 @@ public:
     static void Validate(const Context& context, const GuestSamplerResource& descriptor);
     static bool ShaderAppliesLodBias(const GuestSamplerResource& descriptor);
     static bool ReadsOpaqueBlackBorder(const GuestSamplerResource& descriptor);
+    static bool ValidateTableBorder(const GuestSamplerResource& descriptor, std::uint32_t control);
 
 private:
     void release() noexcept;

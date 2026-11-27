@@ -183,10 +183,6 @@ std::uint32_t DeviceMemoryLdsBytes(const RecompileRequest& request) {
     return bytes + 4u > request.target.maxWorkgroupSharedMemoryBytes ? static_cast<std::uint32_t>(bytes) : 0u;
 }
 
-bool BindlessLowering(const RecompileRequest& request) {
-    return request.target.bindlessImages && (request.shader.stage == ShaderStage::Fragment || !request.graphics || !request.graphics->mesh);
-}
-
 bool HardwareFloat32Flush(const RecompileRequest& request) {
     return request.target.float32FlushToZero && (!request.context.floatMode.has_value() || ((request.context.floatMode->floatMode >> 4u) & 3u) == 0u);
 }
@@ -429,7 +425,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     dumpIr("srt");
 
     constexpr ResourceTracker resourceTracker;
-    resourceTracker.Track(program, BindlessLowering(request));
+    resourceTracker.Track(program, request.target.bindlessImages);
     deadCodeEliminator.Eliminate(program);
     dumpIr("resources");
     if (inputInfo.compute != nullptr) ProveImageOverwrites(program, {inputInfo.compute->threadsNum[0], inputInfo.compute->threadsNum[1], inputInfo.compute->threadsNum[2]});
@@ -846,7 +842,7 @@ void prepareInterface(const RecompileRequest& request, IrProgram& program) {
 
     constexpr ShaderInfoCollector shaderInfoCollector;
     shaderInfoCollector.Collect(program, inputInfo);
-    if (BindlessLowering(request) && ResourceMaterializer::UsesBindlessImages(program.Info(), program.Resources().stage)) {
+    if (request.target.bindlessImages && ResourceMaterializer::UsesBindlessImages(program.Info(), program.Resources().stage)) {
         program.Info().usesDma = true;
         program.Info().usesFaultBuffer = true;
     }
@@ -928,7 +924,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.spannedShuffleThroughMemory = request.target.spannedShuffleThroughMemory;
     targetOptions.spannedUnreachableStays = request.target.spannedUnreachableStays || request.target.spannedUnreachableVerify;
     targetOptions.spannedUnreachableVerify = request.target.spannedUnreachableVerify;
-    targetOptions.bindlessImages = BindlessLowering(request);
+    targetOptions.bindlessImages = request.target.bindlessImages;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
@@ -952,7 +948,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     result.registrationModule = registration;
     if (request.shader.stage == ShaderStage::Mesh && request.graphics) result.meshBarycentrics = request.graphics->meshBarycentrics;
     result.layerReplaySafe = LayerReplaySafe(program);
-    result.bindlessHeap = BindlessLowering(request) && ResourceMaterializer::UsesBindlessImages(program.Info(), program.Resources().stage);
+    result.bindlessHeap = request.target.bindlessImages && ResourceMaterializer::UsesBindlessImages(program.Info(), program.Resources().stage);
     if (result.bindlessHeap) ResourceMaterializer::RegisterBindlessInterfaces(program.Info(), program.Resources().stage);
     result.stencilReplaySafe = (request.shader.stage == ShaderStage::Vertex || stencilReplay) && StencilReplaySafe(program, stencilReplay && StencilReplayNeedsStore(program, request.target.supportedCapabilities));
     result.bdaWrites = program.Info().bdaWrites;

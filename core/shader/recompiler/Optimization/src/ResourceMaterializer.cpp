@@ -2437,7 +2437,7 @@ BindlessInterfaceRegistry& bindlessInterfaces() {
 }
 
 bool ResourceMaterializer::BindlessCandidate(const ImageResource& image, IrShaderStage stage) {
-    if (stage == IrShaderStage::Unknown || stage == IrShaderStage::Fetch || stage == IrShaderStage::Mesh) return false;
+    if (stage == IrShaderStage::Unknown || stage == IrShaderStage::Fetch) return false;
     return image.table != NoTable && !image.nestedTable && !image.packed && image.byElements == 0u && image.resourceClass == ImageResourceClass::Sampled && image.tableOperation == TableOperation::Supported;
 }
 

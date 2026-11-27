@@ -2831,7 +2831,7 @@ struct PixelDraw {
     std::uint32_t quadBroadcasts = 0;
 };
 
-PixelDraw DrawPixelTable(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelCode, std::span<const std::uint32_t> table, std::uint32_t key, const std::array<std::uint32_t, 4>& sampler, float scaleU, float scaleV, bool mesh = false) {
+PixelDraw DrawPixelTable(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelCode, std::span<const std::uint32_t> table, std::uint32_t key, const std::array<std::uint32_t, 4>& sampler, float scaleU, float scaleV, bool mesh = false, std::span<const std::uint32_t> meshTable = {}) {
     const auto target = device.Target();
     std::fill(Pixels.begin(), Pixels.end(), std::byte{0xa5});
     constexpr ShaderRecompiler::MeshConfiguration subgroup{4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u};
@@ -2846,13 +2846,33 @@ PixelDraw DrawPixelTable(AgcDriver::VulkanDevice& device, std::span<const std::u
         std::ranges::copy(geometry, words.begin() + 2);
         return words;
     }();
+    alignas(256) static constexpr auto texturedMeshCode = [] {
+        constexpr std::array<std::uint32_t, 13> readTexel{
+            0xbefe0481u, 0x8f05841cu, 0xf428030au, 0x0a000000u, 0x7e140280u, 0x7e160280u, 0xbf8cc07fu,
+            0xf0008f08u, 0x0003100au, 0xbf8c3f70u, 0xe0700000u, 0x80061000u, 0xbf810000u
+        };
+        std::array<std::uint32_t, meshCode.size() - 1u + readTexel.size()> words{};
+        const auto end = std::copy(meshCode.begin(), meshCode.end() - 1, words.begin());
+        std::ranges::copy(readTexel, end);
+        return words;
+    }();
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
     const auto vertices = mesh ? VertexBuffer(meshVertices.data(), sizeof(meshVertices[0]), draw.indexCount) : VertexBuffer(Triangle.data(), sizeof(Triangle[0]), draw.indexCount);
-    std::vector<std::uint32_t> geometryUserData(mesh ? 12u : 4u, 0u);
+    std::vector<std::uint32_t> geometryUserData(!meshTable.empty() ? 29u : mesh ? 12u : 4u, 0u);
     std::copy(vertices.begin(), vertices.end(), geometryUserData.begin() + (mesh ? 8 : 0));
-    const std::span<const std::uint32_t> code = mesh ? std::span<const std::uint32_t>(meshCode) : std::span<const std::uint32_t>(PlainVertexCode);
+    std::span<const std::uint32_t> code = mesh ? std::span<const std::uint32_t>(meshCode) : std::span<const std::uint32_t>(PlainVertexCode);
+    if (!meshTable.empty()) {
+        Require(mesh, "a mesh image table needs mesh geometry");
+        code = texturedMeshCode;
+        const auto source = Buffer(meshTable.data(), static_cast<std::uint32_t>(meshTable.size_bytes()));
+        const auto output = Buffer(VertexResults.data(), sizeof(VertexResults));
+        std::ranges::copy(source, geometryUserData.begin() + 20);
+        std::ranges::copy(output, geometryUserData.begin() + 24);
+        geometryUserData[28] = key;
+    }
     const auto stage = mesh ? ShaderStage::Mesh : ShaderStage::Vertex;
-    const std::array<ShaderRecompiler::MemoryRegion, 1> geometryMemory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
+    std::vector<ShaderRecompiler::MemoryRegion> geometryMemory{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}};
+    if (!meshTable.empty()) geometryMemory.push_back({reinterpret_cast<std::uintptr_t>(meshTable.data()), std::as_bytes(meshTable)});
     ShaderRecompiler::RecompileRequest geometry{
         {stage, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {64, 0, geometryUserData, std::nullopt, std::nullopt, ShaderRecompiler::ShaderVertexStageInfo{}, geometryMemory},
@@ -2920,12 +2940,12 @@ PixelDraw DrawPixelTable(AgcDriver::VulkanDevice& device, std::span<const std::u
     return result;
 }
 
-void RequirePixelHeap(const PixelDraw& drawn, const std::string& what, AgcDriver::VulkanDevice& device) {
+void RequirePixelHeap(const PixelDraw& drawn, const std::string& what, AgcDriver::VulkanDevice& device, bool geometrySamples = false) {
     Require(drawn.pixelHeap == BindlessHeap(), what + ": the pixel shader was " + (drawn.pixelHeap ? "" : "not ") + "lowered to the descriptor heap");
     const auto capabilities = device.Target().supportedCapabilities;
     const bool quad = std::find(capabilities.begin(), capabilities.end(), SpirvGroupNonUniformQuad) != capabilities.end();
     Require((drawn.quadBroadcasts != 0u) == (BindlessHeap() && quad), what + ": the implicit-LOD heap sample has " + std::to_string(drawn.quadBroadcasts) + " quad broadcasts");
-    Require(!drawn.geometryHeap, what + ": the table-free geometry stage was lowered to the descriptor heap");
+    Require(drawn.geometryHeap == (geometrySamples && BindlessHeap()), what + ": the geometry heap selection differs from the requested image table");
     Require(!BindlessHeap() || !drawn.pixelTableBinding, what + ": the heap-served pixel table kept its image table binding");
 }
 
@@ -3038,6 +3058,20 @@ void RunPixelSampleTests(AgcDriver::VulkanDevice& device) {
         RequirePixelHeap(drawn, "mesh table sampling", device);
         RequirePixels([](std::uint32_t x, std::uint32_t) { return std::array<std::uint32_t, 4>{SampleLevelMark(0), SampleTextureMark(1u + ((x >> 2u) & 1u)), 7u, 255u}; }, "mesh table sampling");
         std::printf("mesh table sampling: alternating textures passed with mesh register buffer %u and fragment heap %u\n", device.Target().meshWindowBuffer, drawn.pixelHeap);
+        alignas(256) static std::array<std::uint32_t, 8> meshTable{};
+        const auto unsignedImage = Image(UintTexels.data(), Format32UInt);
+        const auto signedImage = Image(SintTexels.data(), Format32SInt);
+        std::ranges::copy(unsignedImage, meshTable.begin());
+        std::ranges::copy(signedImage, meshTable.begin() + 4);
+        for (const auto key : {0u, 1u}) {
+            VertexResults.fill(0xdeadbeefu);
+            const auto both = DrawPixelTable(device, PixelSampleWaterfallCode, SampleTable, key, SamplePointSampler, scale, scale, true, meshTable);
+            const auto expected = key == 0u ? UintTexels[0] : static_cast<std::uint32_t>(SintTexels[0]);
+            Require(VertexResults[0] == expected, "mesh image load: read " + Hex(VertexResults[0]) + ", expected " + Hex(expected));
+            RequirePixels([&](std::uint32_t x, std::uint32_t) { return std::array<std::uint32_t, 4>{SampleLevelMark(0), SampleTextureMark(key + ((x >> 2u) & 1u)), 7u, 255u}; }, "mesh image load");
+            RequirePixelHeap(both, "mesh image load", device, true);
+        }
+        std::puts("mesh image load: signed and unsigned texels and paired fragment pixels passed");
     }
     std::puts("image table pixel sampling: implicit LOD and per-pixel textures passed");
 }

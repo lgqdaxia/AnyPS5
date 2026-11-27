@@ -914,6 +914,75 @@ private:
         return decodeBufferDescriptor(value);
     }
 
+    using KeyRange = std::pair<std::uint64_t, std::uint64_t>;
+
+    bool GatherIndirectKeys(const KeyDomain& domain, std::vector<std::uint32_t>& keys, std::vector<KeyRange>& scanned) try {
+        if (domain.offsetReads.empty() || plan.stage != IrShaderStage::Compute || plan.info.bdaWrites) return false;
+        if (std::ranges::any_of(plan.info.images, [](const auto& image) { return image.written || image.atomic; })) return false;
+        std::vector<KeyRange> writes;
+        for (const auto& buffer : plan.info.buffers) {
+            if (!buffer.written && !buffer.atomic) continue;
+            if (plan.descriptorSources.at(buffer.source).tableColumn) return false;
+            const auto descriptor = EvaluateBuffer(buffer.source);
+            if (descriptor.Type() != 0u) return false;
+            if (descriptor.GetSize() != 0u) writes.emplace_back(descriptor.Base48(), descriptor.GetSize());
+        }
+        const auto stable = [&](std::uint64_t address, std::uint64_t size) {
+            if (runtime.pendingWrite != nullptr && runtime.pendingWrite(runtime.userContext, address, size)) return false;
+            return std::ranges::none_of(writes, [&](const KeyRange& range) { return address < range.first + range.second && range.first < address + size; });
+        };
+        const auto& first = domain.offsetReads.front();
+        const auto root = EvaluateBuffer(first.source);
+        if (root.Type() != 0u) return false;
+        const std::uint64_t begin = first.offset & ~3u;
+        const std::uint64_t bytes = root.GetSize();
+        const auto positions = bytes > begin ? (bytes - begin) / 4u : 0u;
+        if (positions > TableKeyScanLimit()) return false;
+        std::vector<std::uint32_t> offsets{0u};
+        std::vector<KeyRange> reads;
+        if (positions != 0u) {
+            const auto base = root.Base48();
+            const auto span = positions * 4u;
+            if (!stable(base + begin, span)) return false;
+            for (std::uint64_t i = 0; i < positions; ++i) {
+                const auto address = base + begin + i * 4u;
+                if (!Accessible(address, sizeof(std::uint32_t))) return false;
+                offsets.push_back(Read(address));
+            }
+            reads.emplace_back(base + begin, span);
+        }
+        const auto follow = [&](std::uint32_t source, std::uint32_t immediate) {
+            const auto buffer = EvaluateBuffer(source);
+            if (buffer.Type() != 0u) return false;
+            const auto base = buffer.Base48();
+            const auto size = buffer.GetSize();
+            std::ranges::sort(offsets);
+            offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+            for (auto& offset : offsets) {
+                const auto position = ImageTableAbi::ScalarBufferDword(offset, immediate, size);
+                if (!position) {
+                    offset = 0u;
+                    continue;
+                }
+                const auto address = base + *position;
+                if (!stable(address, 4u) || !Accessible(address, sizeof(std::uint32_t))) return false;
+                offset = Read(address);
+                reads.emplace_back(address, 4u);
+            }
+            return true;
+        };
+        for (std::size_t i = 1; i < domain.offsetReads.size(); ++i) {
+            const auto& read = domain.offsetReads[i];
+            if (!follow(read.source, read.offset)) return false;
+        }
+        if (!follow(domain.source, domain.offset)) return false;
+        keys.insert(keys.end(), offsets.begin(), offsets.end());
+        scanned.insert(scanned.end(), reads.begin(), reads.end());
+        return true;
+    } catch (const std::runtime_error&) {
+        return false;
+    }
+
     void Narrow(const TableColumn& column, ColumnRecords& records) {
         const auto skip = [&](NarrowSkip reason) {
             auto& counters = tableCounters();
@@ -944,6 +1013,7 @@ private:
             const std::uint64_t first = domain.offset & ~3u;
             const std::uint64_t positions = size >= first + 4u ? (size - first - 4u) / domain.stride + 1u : 0u;
             if (positions > TableKeyScanLimit() || first > 0xffffffffull) {
+                if (GatherIndirectKeys(domain, values, scanned)) continue;
                 auto& widest = tableCounters().narrowPositions;
                 auto seen = widest.load(std::memory_order_relaxed);
                 while (seen < positions && !widest.compare_exchange_weak(seen, positions, std::memory_order_relaxed)) {}

@@ -19,11 +19,19 @@ struct BlockInfo {
     IrValue* indirectTarget = nullptr;
 };
 
+struct KeyBufferRead {
+    std::uint32_t source = 0;
+    std::uint32_t offset = 0;
+
+    bool operator==(const KeyBufferRead& other) const = default;
+};
+
 struct KeyDomain {
     std::uint32_t source = 0;
     std::uint32_t offset = 0;
     std::uint32_t stride = 4;
     bool value = false;
+    std::vector<KeyBufferRead> offsetReads{};
 
     bool operator==(const KeyDomain& other) const = default;
 };

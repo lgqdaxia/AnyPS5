@@ -743,18 +743,7 @@ private:
         return false;
     }
 
-    std::optional<KeyDomain> MatchKeyDomain(IrValue* key) {
-        key = key->Resolve();
-        while (key->Opcode() == IrOpcode::ReadFirstLane && key->ArgumentCount() >= 1u) key = key->Argument(0)->Resolve();
-        DescriptorSource direct;
-        direct.dwordCount = 1u;
-        direct.dwords[0] = key;
-        std::uint32_t badDword = 0;
-        if (ValidateSource(direct, badDword) && !ReadsThroughDescriptor(key)) {
-            KeyDomain domain{InternSource(direct), 0u, 4u};
-            domain.value = true;
-            return domain;
-        }
+    std::optional<KeyBufferRead> MatchKeyBufferRead(IrValue* key) {
         std::uint32_t memoryIndex = 0;
         const MemoryInfo* memory = ScalarReadMemory(*key, memoryIndex);
         if (memory == nullptr) {
@@ -765,15 +754,35 @@ private:
         if (!MakeRuntimeSource(*key->Argument(0)->Resolve(), IrOpcode::GetBufferResource, 4u, sourceIndex, source)) {
             return std::nullopt;
         }
+        return KeyBufferRead{sourceIndex, memory->offset};
+    }
+
+    std::optional<KeyDomain> MatchKeyDomain(IrValue* key) {
+        key = key->Resolve();
+        while (key->Opcode() == IrOpcode::ReadFirstLane && key->ArgumentCount() >= 1u) key = key->Argument(0)->Resolve();
+        DescriptorSource direct;
+        direct.dwordCount = 1u;
+        direct.dwords[0] = key;
+        std::uint32_t badDword = 0;
+        if (ValidateSource(direct, badDword) && !ReadsThroughDescriptor(key)) {
+            return KeyDomain{InternSource(direct), 0u, 4u, true};
+        }
+        const auto outer = MatchKeyBufferRead(key);
+        if (!outer) return std::nullopt;
+        IrValue* offset = key->Argument(1)->Resolve();
         IrValue* selector = nullptr;
         std::uint32_t stride = 0;
         std::uint32_t addend = 0;
-        if (MatchAffineOffset(key->Argument(1), selector, stride, addend)) {
-            return KeyDomain{sourceIndex, memory->offset + addend, stride};
-        }
-        const auto bits = possibleU32Bits(key->Argument(1));
+        if (MatchAffineOffset(offset, selector, stride, addend)) return KeyDomain{outer->source, outer->offset + addend, stride};
+        const auto bits = possibleU32Bits(offset);
         const auto zeros = bits == 0u ? 31u : std::min<std::uint32_t>(static_cast<std::uint32_t>(std::countr_zero(bits)), 31u);
-        return KeyDomain{sourceIndex, memory->offset, std::max(4u, 1u << zeros)};
+        KeyDomain domain{outer->source, outer->offset, std::max(4u, 1u << zeros)};
+        while (const auto read = MatchKeyBufferRead(offset)) {
+            domain.offsetReads.push_back(*read);
+            offset = offset->Argument(1)->Resolve();
+        }
+        std::ranges::reverse(domain.offsetReads);
+        return domain;
     }
 
     static IrValue* SplitImmediateAddend(IrValue* value, std::uint32_t& addend) {

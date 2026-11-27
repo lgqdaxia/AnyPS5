@@ -115,7 +115,8 @@ static_assert(sizeof(GuestRegister) == 8, "GuestRegister changed: update the pla
 static_assert(sizeof(MemoryInfo) == 80, "MemoryInfo changed: update the plan encoder");
 static_assert(sizeof(DescriptorSource) == 224, "DescriptorSource changed: update the plan encoder");
 static_assert(sizeof(TableColumn) == 120, "TableColumn changed: update the plan encoder");
-static_assert(sizeof(KeyDomain) == 16, "KeyDomain changed: update the plan encoder");
+static_assert(sizeof(KeyBufferRead) == 8, "KeyBufferRead changed: update the plan encoder");
+static_assert(sizeof(KeyDomain) == 40, "KeyDomain changed: update the plan encoder");
 static_assert(sizeof(ResourceBlock) == 104, "ResourceBlock changed: update the plan encoder");
 static_assert(sizeof(SrtRead) == 16, "SrtRead changed: update the plan encoder");
 static_assert(sizeof(UniformFill) == 28, "UniformFill changed: update the plan encoder");
@@ -155,7 +156,8 @@ static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update t
 static_assert(fieldCount<MemoryInfo>() == 32, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 4, "DescriptorSource changed: update the plan encoder");
 static_assert(fieldCount<TableColumn>() == 20, "TableColumn changed: update the plan encoder");
-static_assert(fieldCount<KeyDomain>() == 4, "KeyDomain changed: update the plan encoder");
+static_assert(fieldCount<KeyBufferRead>() == 2, "KeyBufferRead changed: update the plan encoder");
+static_assert(fieldCount<KeyDomain>() == 5, "KeyDomain changed: update the plan encoder");
 static_assert(fieldCount<ResourceBlock>() == 5, "ResourceBlock changed: update the plan encoder");
 static_assert(fieldCount<SrtRead>() == 2, "SrtRead changed: update the plan encoder");
 static_assert(fieldCount<UniformFill>() == 5, "UniformFill changed: update the plan encoder");
@@ -1228,6 +1230,10 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
             domains.Value(domain.offset);
             domains.Value(domain.stride);
             domains.Value(domain.value);
+            domains.List(domain.offsetReads, [](Writer& offsets, const KeyBufferRead& read) {
+                offsets.Value(read.source);
+                offsets.Value(read.offset);
+            });
         });
         out.Value(column.unkeyed);
         out.Value(column.indirect);
@@ -1390,11 +1396,15 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         in.Value(column.sampler);
         in.Value(column.address);
         in.Value(column.buffer);
-        in.List(column.keyDomains, 13, [](Reader& domains, KeyDomain& domain) {
+        in.List(column.keyDomains, 21, [](Reader& domains, KeyDomain& domain) {
             domains.Value(domain.source);
             domains.Value(domain.offset);
             domains.Value(domain.stride);
             domains.Value(domain.value);
+            domains.List(domain.offsetReads, 8, [](Reader& offsets, KeyBufferRead& read) {
+                offsets.Value(read.source);
+                offsets.Value(read.offset);
+            });
         });
         in.Value(column.unkeyed);
         in.Value(column.indirect);
@@ -1444,7 +1454,12 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
     const auto knownSource = [&](std::uint32_t source) { return source < plan.descriptorSources.size(); };
     if (!std::ranges::all_of(plan.descriptorSources, [&](const DescriptorSource& source) { return std::ranges::all_of(source.requiredBlocks, [&](std::uint32_t block) { return block < plan.controlFlow.size(); }); })) return false;
     if (!std::ranges::all_of(plan.materializationSources, knownSource)) return false;
-    if (!std::ranges::all_of(plan.descriptorSources, [&](const DescriptorSource& source) { return source.dwordCount <= source.dwords.size() && (!source.tableColumn.has_value() || (knownSource(source.tableColumn->heapSource) && (!source.tableColumn->selected || knownSource(source.tableColumn->selection)) && std::ranges::all_of(source.tableColumn->keyDomains, [&](const KeyDomain& domain) { return knownSource(domain.source); }))); })) return false;
+    const auto validDomain = [&](const KeyDomain& domain) {
+        if (!knownSource(domain.source) || domain.stride < 4u || domain.stride % 4u != 0u) return false;
+        if (domain.value) return domain.offsetReads.empty();
+        return std::ranges::all_of(domain.offsetReads, [&](const KeyBufferRead& read) { return knownSource(read.source); });
+    };
+    if (!std::ranges::all_of(plan.descriptorSources, [&](const DescriptorSource& source) { return source.dwordCount <= source.dwords.size() && (!source.tableColumn.has_value() || (knownSource(source.tableColumn->heapSource) && (!source.tableColumn->selected || knownSource(source.tableColumn->selection)) && std::ranges::all_of(source.tableColumn->keyDomains, validDomain))); })) return false;
     for (const auto& source : plan.descriptorSources) {
         if (!source.tableColumn.has_value()) continue;
         const auto& column = *source.tableColumn;

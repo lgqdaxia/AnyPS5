@@ -20,6 +20,32 @@ namespace {
 namespace Abi = ShaderRecompiler::DeviceImageTableAbi;
 namespace Heap = ShaderRecompiler::BindlessImageAbi;
 
+template <typename Visit>
+void VisitLazyDescriptors(BindlessMemory& memory, const BindlessTableRegistration& registration, std::unique_lock<std::mutex>& lock, Visit visit) {
+    std::array<std::uint32_t, TextureService::PageBytes / sizeof(std::uint32_t)> block;
+    const auto stride = registration.stride / sizeof(std::uint32_t);
+    const auto capacity = 1u + static_cast<std::uint32_t>((block.size() - registration.dwords) / stride);
+    for (std::uint32_t first = 0; first < registration.records;) {
+        const auto count = std::min(capacity, registration.records - first);
+        const auto address = registration.base + static_cast<std::uint64_t>(first) * registration.stride;
+        auto words = std::span(block).first((count - 1u) * stride + registration.dwords);
+        lock.unlock();
+        if (!memory.Read(address, words)) {
+            for (std::uint32_t i = 0; i < count; ++i) {
+                auto slot = words.subspan(i * stride, registration.dwords);
+                if (count == 1u || !memory.Read(address + static_cast<std::uint64_t>(i) * registration.stride, slot)) std::fill(slot.begin(), slot.end(), 0u);
+            }
+        }
+        lock.lock();
+        for (std::uint32_t i = 0; i < count; ++i) {
+            std::array<std::uint32_t, Abi::DescriptorWords> descriptor{};
+            std::copy_n(words.data() + i * stride, registration.dwords, descriptor.begin());
+            visit(descriptor);
+        }
+        first += count;
+    }
+}
+
 std::atomic<std::uint64_t> oldPathNanoseconds{0};
 
 std::uint64_t Elapsed(std::chrono::steady_clock::time_point started) {
@@ -548,6 +574,7 @@ void TextureService::replace(const DeviceImageKeys::Key& key, Recorder& recorder
         kept.generation = fresh.generation;
         kept.perUse = fresh.perUse;
         kept.dcc = fresh.dcc;
+        if (kept.perUse && perUseKeys.insert(key).second) ++perUseEpoch;
         if (!kept.perUse && perUseKeys.erase(key) != 0u) ++perUseEpoch;
         return;
     }
@@ -690,28 +717,57 @@ void TextureService::reverify(Tracked& tracked, Recorder& recorder, Lock& lock) 
     commitPrepared(prepared, recorder, lock);
 }
 
-void TextureService::revalidateServed(Tracked& tracked, Recorder& recorder, Lock& lock) {
-    if (tracked.surfaceEpoch != surfaceEpoch) {
-        tracked.surfaceKeys.clear();
-        tracked.surfaces.clear();
-        std::set<DeviceImageKeys::Key> seen;
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-        for (std::uint32_t record = 0; record < tracked.registration.records; ++record) {
-            for (const auto& key : recordKeys(tracked, record)) {
-                if (!seen.insert(key).second) continue;
-                const auto found = entries.find(key);
-                if (found == entries.end() || found->second.resolution.owner == nullptr || found->second.resolution.bytes == 0u) continue;
-                tracked.surfaceKeys.push_back(key);
-                ranges.emplace_back(found->second.resolution.address, found->second.resolution.address + found->second.resolution.bytes);
-            }
-        }
-        std::sort(ranges.begin(), ranges.end());
-        for (const auto& range : ranges) {
-            if (!tracked.surfaces.empty() && range.first <= tracked.surfaces.back().second) tracked.surfaces.back().second = std::max(tracked.surfaces.back().second, range.second);
-            else tracked.surfaces.push_back(range);
-        }
-        tracked.surfaceEpoch = surfaceEpoch;
+void TextureService::updateServedKeys(Tracked& tracked, Lock& lock) {
+    const bool entriesChanged = tracked.surfaceEpoch != surfaceEpoch || tracked.perUseEpoch != perUseEpoch;
+    const auto& registration = tracked.registration;
+    const bool resident = !owners.empty() || !perUseKeys.empty();
+    if (options.lazy && resident) {
+        const auto bytes = static_cast<std::size_t>(tracked.span);
+        lock.unlock();
+        const auto serial = memory->MappingSerial();
+        const auto generation = memory->Collect(registration.base, bytes);
+        const bool unchanged = !entriesChanged && tracked.lazyMapping == serial && memory->Unchanged(registration.base, bytes, tracked.oldest);
+        lock.lock();
+        if (unchanged) return;
+        tracked.oldest = generation;
+        tracked.lazyMapping = serial;
+    } else if (!entriesChanged) {
+        return;
     }
+    tracked.surfaceKeys.clear();
+    tracked.surfaces.clear();
+    tracked.perUse.clear();
+    std::set<DeviceImageKeys::Key> seen;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    const auto remember = [&](std::span<const std::uint32_t, Abi::DescriptorWords> descriptor) {
+        if (Abi::NullDescriptor(descriptor[0], descriptor[1])) return;
+        for (const auto& use : registration.uses) {
+            const auto key = Heap::MakeKey(descriptor, use.interfaceId, use.samplerClass, use.sampler);
+            const auto found = entries.find(key);
+            if (found == entries.end() || !seen.insert(key).second) continue;
+            if (perUseKeys.contains(key)) tracked.perUse.push_back(key);
+            const auto& resolution = found->second.resolution;
+            if (resolution.owner == nullptr || resolution.bytes == 0u) continue;
+            tracked.surfaceKeys.push_back(key);
+            ranges.emplace_back(resolution.address, resolution.address + resolution.bytes);
+        }
+    };
+    if (options.lazy && resident) {
+        VisitLazyDescriptors(*memory, registration, lock, remember);
+    } else {
+        for (std::size_t offset = 0; offset < tracked.words.size(); offset += Abi::DescriptorWords) remember(std::span<const std::uint32_t, Abi::DescriptorWords>(tracked.words.data() + offset, Abi::DescriptorWords));
+    }
+    std::sort(ranges.begin(), ranges.end());
+    for (const auto& range : ranges) {
+        if (!tracked.surfaces.empty() && range.first <= tracked.surfaces.back().second) tracked.surfaces.back().second = std::max(tracked.surfaces.back().second, range.second);
+        else tracked.surfaces.push_back(range);
+    }
+    tracked.surfaceEpoch = surfaceEpoch;
+    tracked.perUseEpoch = perUseEpoch;
+}
+
+void TextureService::revalidateServed(Tracked& tracked, Recorder& recorder, Lock& lock) {
+    updateServedKeys(tracked, lock);
     if (tracked.surfaceKeys.empty()) return;
     const auto surfaces = tracked.surfaces;
     const auto keys = tracked.surfaceKeys;
@@ -767,15 +823,7 @@ void TextureService::refreshPerUse(std::span<const std::uint64_t> served, Record
         auto found = tables.find(id);
         if (found == tables.end()) continue;
         auto& tracked = found->second;
-        if (tracked.perUseEpoch != perUseEpoch) {
-            tracked.perUse.clear();
-            for (std::uint32_t record = 0; record < tracked.registration.records; ++record) {
-                for (const auto& key : recordKeys(tracked, record)) {
-                    if (perUseKeys.contains(key)) tracked.perUse.push_back(key);
-                }
-            }
-            tracked.perUseEpoch = perUseEpoch;
-        }
+        if (tracked.surfaceEpoch != surfaceEpoch || tracked.perUseEpoch != perUseEpoch) updateServedKeys(tracked, lock);
         keys.insert(tracked.perUse.begin(), tracked.perUse.end());
     }
     for (const auto& key : keys) {

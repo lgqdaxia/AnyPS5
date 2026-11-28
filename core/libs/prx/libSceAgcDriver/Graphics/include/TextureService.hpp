@@ -193,6 +193,7 @@ private:
         std::vector<std::uint32_t> words;
         std::vector<std::uint64_t> pageGenerations;
         std::uint64_t oldest = 0;
+        std::uint64_t lazyMapping = 0;
         std::uint64_t firstPage = 0;
         std::uint64_t span = 0;
         std::vector<BindlessPrepared> pending;
@@ -247,6 +248,7 @@ private:
     std::uint64_t currentBudget();
     void redecode(Tracked& table, Recorder& recorder, Lock& lock);
     void reverify(Tracked& table, Recorder& recorder, Lock& lock);
+    void updateServedKeys(Tracked& table, Lock& lock);
     void revalidateServed(Tracked& table, Recorder& recorder, Lock& lock);
     void resolveMisses(Recorder& recorder, Lock& lock);
     std::vector<DeviceImageMiss> unresolved(std::span<const DeviceImageMiss> misses) const;

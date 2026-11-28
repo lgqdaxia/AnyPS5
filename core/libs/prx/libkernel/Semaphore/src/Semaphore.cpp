@@ -9,7 +9,6 @@
 #include <cstdlib>
 #include <memory>
 
-#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -36,8 +35,8 @@ static std::shared_ptr<KernelSemaPrivate> FindSema(KernelSema handle) {
 
 extern "C" {
 
-KernelSemaPrivate* KernelSemaObjectForTests_nid_no_patch(KernelSema handle) {
- return FindSema(handle).get();
+std::shared_ptr<KernelSemaPrivate> KernelSemaObjectForTests_nid_no_patch(KernelSema handle) {
+ return FindSema(handle);
 }
 
 int APS5_VABI sceKernelCreateSema(KernelSema* sem, const char* name, uint32_t attr, int init, int max, void* opt) {

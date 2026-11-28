@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <string>
 
@@ -39,7 +40,7 @@ struct KernelSemaPrivate {
 
 extern "C" {
 
-KernelSemaPrivate* KernelSemaObjectForTests_nid_no_patch(KernelSema handle);
+std::shared_ptr<KernelSemaPrivate> KernelSemaObjectForTests_nid_no_patch(KernelSema handle);
 int APS5_VABI sceKernelCreateSema(KernelSema* sem, const char* name, uint32_t attr, int init, int max, void* opt);
 int APS5_VABI sceKernelDeleteSema(KernelSema sem);
 int APS5_VABI sceKernelPollSema(KernelSema sem, int need);

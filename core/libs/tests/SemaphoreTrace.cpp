@@ -15,7 +15,7 @@ int main() {
     std::atomic<int> result{-1};
     std::thread waiter([&] { result.store(sceKernelWaitSema(sem, 1, nullptr)); });
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    KernelSemaPrivate* object = KernelSemaObjectForTests_nid_no_patch(sem);
+    const auto object = KernelSemaObjectForTests_nid_no_patch(sem);
     if (object == nullptr) return 4;
     for (;;) {
         {

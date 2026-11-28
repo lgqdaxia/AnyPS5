@@ -139,8 +139,10 @@ static void RequireDeleteDuringUse() {
 }
 
 static int WaiterCount(KernelSema sem) {
-    std::lock_guard<std::mutex> lock(sem->mutex);
-    return sem->waiterCount;
+    const auto object = KernelSemaObjectForTests_nid_no_patch(sem);
+    Require(object != nullptr);
+    std::lock_guard<std::mutex> lock(object->mutex);
+    return object->waiterCount;
 }
 
 static void RequireZeroTimeout() {

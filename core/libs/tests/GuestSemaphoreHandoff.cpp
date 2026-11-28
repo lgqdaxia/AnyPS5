@@ -27,7 +27,7 @@ static void* APS5_VABI Wait(void* arg) {
 static std::atomic<int> released{0};
 
 static int QueuedCount(KernelSema sem) {
-    KernelSemaPrivate* object = KernelSemaObjectForTests_nid_no_patch(sem);
+    const auto object = KernelSemaObjectForTests_nid_no_patch(sem);
     Require(object != nullptr);
     std::lock_guard<std::mutex> lock(object->mutex);
     return static_cast<int>(object->queue.size());
@@ -90,7 +90,7 @@ static void CheckPassesOverALargerNeed() {
 static void CheckDeletedRefusesFreeTokens() {
     KernelSema sem = nullptr;
     Require(sceKernelCreateSema(&sem, "handoff-deleted", SemaFifo, 2, 2, nullptr) == SCE_OK);
-    KernelSemaPrivate* object = KernelSemaObjectForTests_nid_no_patch(sem);
+    const auto object = KernelSemaObjectForTests_nid_no_patch(sem);
     Require(object != nullptr);
     {
         std::lock_guard<std::mutex> lock(object->mutex);

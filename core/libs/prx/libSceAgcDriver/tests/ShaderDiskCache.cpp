@@ -2574,6 +2574,17 @@ void verifySharedPlans() {
 void verifyPlanRoundTrip() {
     const auto handBuilt = handBuiltPlan();
     const auto handBytes = encodedPlan(handBuilt);
+
+    auto twoImages = handBuiltPlan();
+    auto image = twoImages.info.images.front();
+    image.nestedTable = true;
+    image.overwrite.fullGroups = 3u;
+    twoImages.info.images.push_back(image);
+    const auto twoImageBytes = encodedPlan(twoImages);
+    require(twoImageBytes.size() == handBytes.size() + 236u, "the encoded image record no longer matches the reader's minimum size");
+    IrResourcePlan twoDecoded;
+    require(ShaderDiskCache::DecodePlan(twoImageBytes, twoDecoded) && twoDecoded.info.images.size() == 2u && twoDecoded.info.images.back().nestedTable && twoDecoded.info.images.back().overwrite == image.overwrite, "the nested image or its overwrite proof changed in a disk-cache round trip");
+
     IrResourcePlan handDecoded;
     require(ShaderDiskCache::DecodePlan(handBytes, handDecoded), "the hand-built plan does not decode");
     require(encodedPlan(handDecoded) == handBytes && handDecoded.valueStorage.Size() == handBuilt.valueStorage.Size() && handDecoded.blockStorage.size() == handBuilt.blockStorage.size(), "the hand-built plan changed in a round trip");
